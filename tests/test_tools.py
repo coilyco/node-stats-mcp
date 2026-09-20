@@ -2283,6 +2283,39 @@ def test_k3s_logs_redact_secrets_and_report_truncation(
     assert got["truncated"] is False
 
 
+def test_k3s_log_request_accepts_any_media_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A narrow Accept gets 406 from the API, and mocking the transport hid that."""
+    server = _load(monkeypatch, "/", "")
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        def __enter__(self) -> _Resp:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self, size: int) -> bytes:
+            return b"line\n"
+
+    def fake_urlopen(req: Any, **kwargs: Any) -> _Resp:
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        captured["url"] = req.full_url
+        return _Resp()
+
+    monkeypatch.setattr(
+        server,
+        "_k8s_transport",
+        lambda: SimpleNamespace(base_url="https://api", headers={}, ssl_context=None),
+    )
+    monkeypatch.setattr(server, "urlopen", fake_urlopen)
+
+    server._k8s_request_text("/api/v1/namespaces/apps/pods/api-1/log", {"tailLines": "5"})
+
+    assert captured["headers"]["accept"] == "*/*"
+    assert "tailLines=5" in captured["url"]
+
+
 def test_k3s_logs_refuse_a_denied_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
     """The bound is config, so it has to be honoured before the request is made."""
     server = _load(monkeypatch, "/", "")

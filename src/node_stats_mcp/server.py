@@ -417,7 +417,9 @@ def _k8s_request_text(
     query = f"?{urlencode(params)}" if params else ""
     req = Request(
         f"{transport.base_url}{path}{query}",
-        headers={**transport.headers, "Accept": "text/plain"},
+        # */* not text/plain: the log subresource is a raw stream and the API
+        # server's negotiation answers a narrow Accept with 406 (#7965).
+        headers={**transport.headers, "Accept": "*/*"},
     )
     with urlopen(req, timeout=_K8S_TIMEOUT_SECONDS, context=transport.ssl_context) as resp:
         # Read one byte past the cap so the caller can report truncation honestly.
