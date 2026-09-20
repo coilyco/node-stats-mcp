@@ -86,6 +86,14 @@ _K3S_VOLUME_ROOTS = tuple(
 )
 _MAX_K3S_VOLUME_PATHS = int(os.environ.get("NODE_STATS_MAX_K3S_VOLUME_PATHS", "1000"))
 
+# Log reads are the one k3s tool that can carry a secret out of the cluster, so
+# they are capped at the socket and redacted on the way out. See docs/tools-k3s.md.
+_K3S_LOG_MAX_BYTES = int(os.environ.get("NODE_STATS_K3S_LOG_MAX_BYTES", "65536"))
+_K3S_LOG_MAX_TAIL_LINES = int(os.environ.get("NODE_STATS_K3S_LOG_MAX_TAIL_LINES", "500"))
+_K3S_LOG_DENY_NAMESPACES = tuple(
+    ns for ns in os.environ.get("NODE_STATS_K3S_LOG_DENY_NAMESPACES", "").split(":") if ns
+)
+
 _DISK_WARN_PERCENT = float(os.environ.get("NODE_STATS_DISK_WARN_PERCENT", "80"))
 _DISK_CRITICAL_PERCENT = float(os.environ.get("NODE_STATS_DISK_CRITICAL_PERCENT", "85"))
 
@@ -370,6 +378,58 @@ def _k8s_list(path: str) -> tuple[list[dict[str, Any]], list[str]]:
         if not token:
             break
     return items, errors
+
+
+# Validated, not escaped: a selector reaches the API as a path segment.
+# See docs/security.md.
+_K8S_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
+
+
+def _validated_k8s_name(value: str | None, field: str) -> str | None:
+    if value is None or value == "":
+        return None
+    text = str(value)
+    if not _K8S_NAME_RE.fullmatch(text):
+        raise ValueError(f"{field} must be a valid Kubernetes name")
+    return text
+
+
+def _k8s_namespaced_list(
+    api: str, resource: str, namespace: str | None
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """List one resource, narrowing to a namespace at the API rather than locally.
+
+    Filtering server-side is what keeps a one-namespace question from paging the
+    whole cluster back through the tool result (node-stats-mcp#7965).
+    """
+    checked = _validated_k8s_name(namespace, "namespace")
+    if checked:
+        return _k8s_list(f"{api}/namespaces/{quote(checked)}/{resource}")
+    return _k8s_list(f"{api}/{resource}")
+
+
+def _k8s_request_text(
+    path: str, params: dict[str, str] | None = None, max_bytes: int = 65536
+) -> str:
+    transport = _k8s_transport()
+    if transport is None:
+        raise ValueError("Kubernetes API is unavailable")
+    query = f"?{urlencode(params)}" if params else ""
+    req = Request(
+        f"{transport.base_url}{path}{query}",
+        headers={**transport.headers, "Accept": "text/plain"},
+    )
+    with urlopen(req, timeout=_K8S_TIMEOUT_SECONDS, context=transport.ssl_context) as resp:
+        # Read one byte past the cap so the caller can report truncation honestly.
+        return resp.read(max_bytes + 1).decode("utf-8", errors="replace")
+
+
+def _name_selected(value: Any, name: str | None, prefix: str | None) -> bool:
+    if name and str(value) != name:
+        return False
+    if prefix and not str(value).startswith(prefix):
+        return False
+    return True
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
@@ -1251,12 +1311,19 @@ def _normalize_condition_resource_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _k3s_configured_conditions(limit_per_source: int) -> dict[str, Any]:
+def _k3s_configured_conditions(
+    limit_per_source: int,
+    namespace: str | None = None,
+    name: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
     configs, errors = _configured_objects(
         _K3S_CONDITION_RESOURCES_JSON,
         "NODE_STATS_K3S_CONDITION_RESOURCES",
     )
     cap = max(1, min(limit_per_source, 100))
+    selected_name = _validated_k8s_name(name, "name")
+    _validated_k8s_name(namespace, "namespace")
     sources: list[dict[str, Any]] = []
     for index, config in enumerate(configs):
         name = config.get("name")
@@ -1267,8 +1334,15 @@ def _k3s_configured_conditions(limit_per_source: int) -> dict[str, Any]:
         if path_error:
             errors.append(f"condition resource {name!r}: {path_error}")
             continue
+        # `name` is the configured source name here, not the object selector.
+        if source and source.lower() != name.lower():
+            continue
         items, source_errors = _k8s_list(str(path))
         normalized = [_normalize_condition_resource_item(item) for item in items]
+        if namespace:
+            normalized = [i for i in normalized if i.get("namespace") == namespace]
+        if selected_name:
+            normalized = [i for i in normalized if i.get("name") == selected_name]
         normalized.sort(
             key=lambda item: (
                 item["ready"] not in ("True", True),
@@ -1292,6 +1366,383 @@ def _k3s_configured_conditions(limit_per_source: int) -> dict[str, Any]:
     return {
         "sources": sources,
         "configured_source_count": len(configs),
+        "errors": errors,
+    }
+
+
+_WORKLOAD_KINDS: dict[str, tuple[str, str, str]] = {
+    "deployment": ("/apis/apps/v1", "deployments", "Deployment"),
+    "statefulset": ("/apis/apps/v1", "statefulsets", "StatefulSet"),
+    "daemonset": ("/apis/apps/v1", "daemonsets", "DaemonSet"),
+}
+
+_NETWORK_KINDS: dict[str, tuple[str, str, str]] = {
+    "service": ("/api/v1", "services", "Service"),
+    "ingress": ("/apis/networking.k8s.io/v1", "ingresses", "Ingress"),
+    "endpointslice": ("/apis/discovery.k8s.io/v1", "endpointslices", "EndpointSlice"),
+}
+
+# Backstop only, and the deny list is the control that binds.
+# See docs/security.md.
+_LOG_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)((?:--?)?(?:user[_-]?token|api[_-]?key|access[_-]?key|password|passwd"
+    r"|secret|token|authorization|bearer)[\"']?\s*[=:]\s*[\"']?)([^\s\"',;)]{4,})"
+)
+_LOG_SECRET_LITERAL_RES = (
+    re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"),
+    re.compile(r"\b(?:gh[pousr]|xox[baprs])_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+def _redact_log_text(text: str) -> tuple[str, int]:
+    redactions = 0
+
+    def _assignment(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return f"{match.group(1)}<REDACTED>"
+
+    redacted = _LOG_SECRET_ASSIGNMENT_RE.sub(_assignment, text)
+    for pattern in _LOG_SECRET_LITERAL_RES:
+        redacted, count = pattern.subn("<REDACTED>", redacted)
+        redactions += count
+    return redacted, redactions
+
+
+def _k3s_pods(
+    namespace: str | None, name: str | None, name_prefix: str | None, limit: int
+) -> dict[str, Any]:
+    items, errors = _k8s_namespaced_list("/api/v1", "pods", namespace)
+    pods = [_normalize_pod_for_index(item) for item in items]
+    selected = [pod for pod in pods if _name_selected(pod.get("pod"), name, name_prefix)]
+    # Unhealthy first: a caller narrowing to a namespace is looking for the
+    # broken one, and a cap that truncates past it answers the wrong question.
+    selected.sort(key=lambda pod: (pod.get("phase") == "Running", pod.get("pod") or ""))
+    cap = max(1, min(limit, 500))
+    return {
+        "namespace": namespace,
+        "pods": selected[:cap],
+        "pod_count": len(selected),
+        "returned_pod_count": min(len(selected), cap),
+        "errors": errors,
+    }
+
+
+def _normalize_workload(item: dict[str, Any], kind: str) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    template = spec.get("template", {})
+    template_spec = template.get("spec", {}) if isinstance(template, dict) else {}
+    created = _timestamp_age(metadata.get("creationTimestamp"))
+    images = [
+        {"container": container.get("name"), "image": container.get("image")}
+        for container in template_spec.get("containers", [])
+        if isinstance(container, dict)
+    ]
+    if kind == "DaemonSet":
+        desired = status.get("desiredNumberScheduled")
+        ready = status.get("numberReady")
+        updated = status.get("updatedNumberScheduled")
+        available = status.get("numberAvailable")
+    else:
+        desired = spec.get("replicas")
+        ready = status.get("readyReplicas")
+        updated = status.get("updatedReplicas")
+        available = status.get("availableReplicas")
+    generation = metadata.get("generation")
+    observed = status.get("observedGeneration")
+    rollout_complete: bool | None = None
+    if desired is not None:
+        rollout_complete = (
+            (ready or 0) == desired
+            and (updated or 0) == desired
+            and (generation is None or observed == generation)
+        )
+    return {
+        "kind": kind,
+        "namespace": metadata.get("namespace"),
+        "name": metadata.get("name"),
+        "created_at": created["timestamp"],
+        "age_seconds": created["age_seconds"],
+        "age": created["age"],
+        "generation": generation,
+        "observed_generation": observed,
+        # The spec image, not the running pod image. They differ exactly when a
+        # rollout was applied and has not landed, which is the question asked.
+        "spec_images": images,
+        "desired_replicas": desired,
+        "ready_replicas": ready,
+        "updated_replicas": updated,
+        "available_replicas": available,
+        "rollout_complete": rollout_complete,
+        "conditions": _normalize_conditions(status.get("conditions")),
+    }
+
+
+def _k3s_workloads(
+    namespace: str | None, name: str | None, kind: str | None, limit: int
+) -> dict[str, Any]:
+    if kind is not None and kind.lower() not in _WORKLOAD_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(sorted(_WORKLOAD_KINDS))}")
+    wanted = [kind.lower()] if kind else sorted(_WORKLOAD_KINDS)
+    workloads: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for key in wanted:
+        api, resource, display = _WORKLOAD_KINDS[key]
+        items, kind_errors = _k8s_namespaced_list(api, resource, namespace)
+        errors.extend(kind_errors)
+        workloads.extend(
+            _normalize_workload(item, display)
+            for item in items
+            if _name_selected(item.get("metadata", {}).get("name"), name, None)
+        )
+    workloads.sort(key=lambda w: (w.get("rollout_complete") is not False, w.get("name") or ""))
+    cap = max(1, min(limit, 300))
+    return {
+        "namespace": namespace,
+        "workloads": workloads[:cap],
+        "workload_count": len(workloads),
+        "returned_workload_count": min(len(workloads), cap),
+        "errors": errors,
+    }
+
+
+def _normalize_persistent_volume(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    claim_ref = spec.get("claimRef", {})
+    return {
+        "persistent_volume": metadata.get("name"),
+        "phase": status.get("phase"),
+        "reason": status.get("reason"),
+        "message": status.get("message"),
+        "storage_class": spec.get("storageClassName"),
+        "reclaim_policy": spec.get("persistentVolumeReclaimPolicy"),
+        "capacity_bytes": _parse_quantity(spec.get("capacity", {}).get("storage")),
+        "deletion_timestamp": metadata.get("deletionTimestamp"),
+        "claim": {
+            "namespace": claim_ref.get("namespace"),
+            "name": claim_ref.get("name"),
+        },
+    }
+
+
+def _k3s_storage_claims(namespace: str | None, name: str | None, limit: int) -> dict[str, Any]:
+    pvc_items, errors = _k8s_namespaced_list("/api/v1", "persistentvolumeclaims", namespace)
+    pv_items, pv_errors = _k8s_list("/api/v1/persistentvolumes")
+    errors.extend(pv_errors)
+    volumes = {
+        item.get("metadata", {}).get("name"): _normalize_persistent_volume(item)
+        for item in pv_items
+    }
+    claims: list[dict[str, Any]] = []
+    for item in pvc_items:
+        if not _name_selected(item.get("metadata", {}).get("name"), name, None):
+            continue
+        claim = _normalize_pvc(item)
+        claim["persistent_volume_detail"] = volumes.get(claim.get("persistent_volume"))
+        claims.append(claim)
+    claims.sort(key=lambda c: (c.get("phase") == "Bound", c.get("persistent_volume_claim") or ""))
+    cap = max(1, min(limit, 300))
+    return {
+        "namespace": namespace,
+        "claims": claims[:cap],
+        "claim_count": len(claims),
+        "returned_claim_count": min(len(claims), cap),
+        "errors": errors,
+    }
+
+
+def _k3s_events(
+    namespace: str | None,
+    kind: str | None,
+    name: str | None,
+    limit: int,
+    max_age_hours: int,
+) -> dict[str, Any]:
+    items, errors = _k8s_namespaced_list("/api/v1", "events", namespace)
+    events = [_normalize_event(item) for item in items]
+    cutoff = max(1, max_age_hours) * 3600
+    selected = []
+    for event in events:
+        age = event.get("age_seconds")
+        if age is not None and age > cutoff:
+            continue
+        involved = event.get("object", {})
+        if kind and str(involved.get("kind", "")).lower() != kind.lower():
+            continue
+        if name and not _name_selected(involved.get("name"), name, None):
+            continue
+        selected.append(event)
+    # Warnings first, then newest: the ordering a reader wants when an object
+    # has fifty Normal events and one Warning that explains the incident.
+    selected.sort(key=lambda e: (e.get("type") != "Warning", e.get("age_seconds") or 0))
+    cap = max(1, min(limit, 200))
+    return {
+        "namespace": namespace,
+        "events": selected[:cap],
+        "event_count": len(selected),
+        "returned_event_count": min(len(selected), cap),
+        "max_age_hours": max_age_hours,
+        "errors": errors,
+    }
+
+
+def _k3s_namespaces(limit: int) -> dict[str, Any]:
+    items, errors = _k8s_list("/api/v1/namespaces")
+    namespaces = []
+    for item in items:
+        metadata = item.get("metadata", {})
+        created = _timestamp_age(metadata.get("creationTimestamp"))
+        namespaces.append(
+            {
+                "namespace": metadata.get("name"),
+                "phase": item.get("status", {}).get("phase"),
+                "created_at": created["timestamp"],
+                "age_seconds": created["age_seconds"],
+                "age": created["age"],
+                "deletion_timestamp": metadata.get("deletionTimestamp"),
+                "finalizers": (metadata.get("finalizers") or [])[:20],
+            }
+        )
+    namespaces.sort(key=lambda n: n.get("namespace") or "")
+    cap = max(1, min(limit, 500))
+    return {
+        "namespaces": namespaces[:cap],
+        "namespace_count": len(namespaces),
+        "returned_namespace_count": min(len(namespaces), cap),
+        "errors": errors,
+    }
+
+
+def _normalize_network_object(item: dict[str, Any], kind: str) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    normalized: dict[str, Any] = {
+        "kind": kind,
+        "namespace": metadata.get("namespace"),
+        "name": metadata.get("name"),
+    }
+    if kind == "Service":
+        normalized["type"] = spec.get("type")
+        normalized["cluster_ip"] = spec.get("clusterIP")
+        normalized["selector"] = spec.get("selector")
+        normalized["ports"] = [
+            {
+                "name": port.get("name"),
+                "port": port.get("port"),
+                "target_port": port.get("targetPort"),
+                "node_port": port.get("nodePort"),
+                "protocol": port.get("protocol"),
+            }
+            for port in spec.get("ports", [])
+            if isinstance(port, dict)
+        ][:50]
+    elif kind == "Ingress":
+        normalized["ingress_class"] = spec.get("ingressClassName")
+        normalized["hosts"] = [
+            rule.get("host") for rule in spec.get("rules", []) if isinstance(rule, dict)
+        ][:50]
+        normalized["tls_secrets"] = [
+            tls.get("secretName") for tls in spec.get("tls", []) if isinstance(tls, dict)
+        ][:50]
+    else:
+        # An EndpointSlice with no ready address is the shape of a Service that
+        # resolves and answers nothing, which a Service read alone cannot show.
+        endpoints = item.get("endpoints", []) or []
+        ready = sum(
+            1
+            for endpoint in endpoints
+            if isinstance(endpoint, dict) and endpoint.get("conditions", {}).get("ready")
+        )
+        normalized["service"] = metadata.get("labels", {}).get("kubernetes.io/service-name")
+        normalized["endpoint_count"] = len(endpoints)
+        normalized["ready_endpoint_count"] = ready
+        normalized["ports"] = [
+            {"name": port.get("name"), "port": port.get("port")}
+            for port in item.get("ports", []) or []
+            if isinstance(port, dict)
+        ][:50]
+    return normalized
+
+
+def _k3s_network(namespace: str | None, name: str | None, limit: int) -> dict[str, Any]:
+    objects: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for key in sorted(_NETWORK_KINDS):
+        api, resource, display = _NETWORK_KINDS[key]
+        items, kind_errors = _k8s_namespaced_list(api, resource, namespace)
+        errors.extend(kind_errors)
+        for item in items:
+            candidate = item.get("metadata", {}).get("name")
+            service_label = (
+                item.get("metadata", {}).get("labels", {}).get("kubernetes.io/service-name")
+            )
+            if name and not (_name_selected(candidate, None, name) or service_label == name):
+                continue
+            objects.append(_normalize_network_object(item, display))
+    cap = max(1, min(limit, 300))
+    return {
+        "namespace": namespace,
+        "objects": objects[:cap],
+        "object_count": len(objects),
+        "returned_object_count": min(len(objects), cap),
+        "errors": errors,
+    }
+
+
+def _k3s_logs(
+    namespace: str,
+    pod: str,
+    container: str | None,
+    tail_lines: int,
+    previous: bool,
+) -> dict[str, Any]:
+    checked_namespace = _validated_k8s_name(namespace, "namespace")
+    checked_pod = _validated_k8s_name(pod, "pod")
+    checked_container = _validated_k8s_name(container, "container")
+    if not checked_namespace or not checked_pod:
+        raise ValueError("namespace and pod are required")
+    if checked_namespace in _K3S_LOG_DENY_NAMESPACES:
+        raise ValueError(f"namespace {checked_namespace!r} is denied for log reads")
+    tail = max(1, min(tail_lines, _K3S_LOG_MAX_TAIL_LINES))
+    params = {"tailLines": str(tail), "timestamps": "true"}
+    if checked_container:
+        params["container"] = checked_container
+    if previous:
+        params["previous"] = "true"
+    path = f"/api/v1/namespaces/{quote(checked_namespace)}/pods/{quote(checked_pod)}/log"
+    errors: list[str] = []
+    try:
+        raw = _k8s_request_text(path, params, _K3S_LOG_MAX_BYTES)
+    except (HTTPError, URLError, ValueError) as exc:
+        return {
+            "namespace": checked_namespace,
+            "pod": checked_pod,
+            "container": checked_container,
+            "previous": previous,
+            "lines": [],
+            "errors": [str(exc)],
+        }
+    truncated = len(raw.encode("utf-8", errors="replace")) > _K3S_LOG_MAX_BYTES
+    if truncated:
+        raw = raw[:_K3S_LOG_MAX_BYTES]
+        # A partial first line is worse than no first line, so drop it.
+        raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+    redacted, redactions = _redact_log_text(raw)
+    lines = [line for line in redacted.splitlines() if line]
+    return {
+        "namespace": checked_namespace,
+        "pod": checked_pod,
+        "container": checked_container,
+        "previous": previous,
+        "tail_lines": tail,
+        "truncated": truncated,
+        "redaction_count": redactions,
+        "lines": lines,
         "errors": errors,
     }
 
@@ -1345,16 +1796,44 @@ def _parse_cgroup_paths(text: str | None) -> _CgroupRefs:
     )
 
 
-def _normalize_pod(item: dict[str, Any]) -> dict[str, Any]:
-    metadata = item.get("metadata", {})
-    status = item.get("status", {})
-    spec = item.get("spec", {})
+_CONTAINER_STATE_FIELDS = (
+    ("reason", "reason"),
+    ("message", "message"),
+    ("exitCode", "exit_code"),
+    ("signal", "signal"),
+    ("startedAt", "started_at"),
+    ("finishedAt", "finished_at"),
+)
+
+
+def _normalize_container_state(value: Any) -> dict[str, Any] | None:
+    """Expand a containerState into the reason, exit code, and timing under it.
+
+    The API nests every useful field one level below running/waiting/terminated,
+    so keeping only the key name discards the whole answer to "why is this not
+    running": OOMKilled and exit 137, ImagePullBackOff and the image it could not
+    pull, CreateContainerConfigError and the missing key (node-stats-mcp#7965).
+    """
+    if not isinstance(value, dict) or not value:
+        return None
+    state_type = next(iter(value), None)
+    detail = value.get(state_type) if state_type else None
+    normalized: dict[str, Any] = {"type": state_type}
+    if isinstance(detail, dict):
+        for api_key, out_key in _CONTAINER_STATE_FIELDS:
+            if api_key in detail:
+                normalized[out_key] = detail[api_key]
+    return normalized
+
+
+def _normalize_pod_containers(
+    specs: Any, statuses: dict[Any, dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
     containers: list[dict[str, Any]] = []
     restart_total = 0
-    statuses = {
-        c.get("name"): c for c in status.get("containerStatuses", []) if isinstance(c, dict)
-    }
-    for container in spec.get("containers", []):
+    if not isinstance(specs, list):
+        return containers, restart_total
+    for container in specs:
         if not isinstance(container, dict):
             continue
         name = container.get("name")
@@ -1369,8 +1848,27 @@ def _normalize_pod(item: dict[str, Any]) -> dict[str, Any]:
                 "restart_count": restart_count,
                 "container_id": _normalize_container_id(container_status.get("containerID")),
                 "state": next(iter(container_status.get("state", {})), None),
+                "state_detail": _normalize_container_state(container_status.get("state")),
+                "last_state": _normalize_container_state(container_status.get("lastState")),
             }
         )
+    return containers, restart_total
+
+
+def _normalize_pod(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    status = item.get("status", {})
+    spec = item.get("spec", {})
+    statuses = {
+        c.get("name"): c for c in status.get("containerStatuses", []) if isinstance(c, dict)
+    }
+    init_statuses = {
+        c.get("name"): c for c in status.get("initContainerStatuses", []) if isinstance(c, dict)
+    }
+    containers, restart_total = _normalize_pod_containers(spec.get("containers"), statuses)
+    # Separate list: restart_count has always meant app-container restarts,
+    # and Init:CrashLoopBackOff is its own diagnosis.
+    init_containers, _ = _normalize_pod_containers(spec.get("initContainers"), init_statuses)
     created = _parse_timestamp(metadata.get("creationTimestamp"))
     now = datetime.now(UTC)
     age_seconds = (now - created).total_seconds() if created else None
@@ -1384,7 +1882,10 @@ def _normalize_pod(item: dict[str, Any]) -> dict[str, Any]:
         "created_at": created.isoformat() if created else None,
         "age_seconds": int(age_seconds) if age_seconds is not None else None,
         "age": _format_age(age_seconds),
+        "reason": status.get("reason"),
+        "message": status.get("message"),
         "containers": containers,
+        "init_containers": init_containers,
     }
 
 
@@ -1671,10 +2172,21 @@ def _k8s_container_memory() -> dict[str, Any]:
     return {"source": source, "containers": containers, "errors": errors}
 
 
-def get_k3s_pods() -> dict[str, Any]:
-    """Namespace, pod, container, and age inventory from the Kubernetes API."""
-    pods, _, _, errors = _k8s_pod_inventory()
-    return {"pods": pods, "errors": errors}
+def get_k3s_pods(
+    namespace: str | None = None,
+    name: str | None = None,
+    name_prefix: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Pods with container state, failure reason, exit code, and restart history.
+
+    Narrow with namespace, an exact name, or a name prefix; the namespace filter
+    is applied at the API, not after the fact. Each container carries state_detail
+    and last_state, which name OOMKilled, ImagePullBackOff, CreateContainerConfigError
+    and the exit code behind a crashloop. Init containers are listed separately.
+    Not-Running pods sort first so a cap never truncates past the broken one.
+    """
+    return _k3s_pods(namespace, name, name_prefix, limit)
 
 
 def get_k3s_container_memory() -> dict[str, Any]:
@@ -1733,12 +2245,106 @@ def get_configured_freshness() -> dict[str, Any]:
     return _configured_freshness()
 
 
-async def get_k3s_configured_conditions(limit_per_source: int = 50) -> dict[str, Any]:
-    """Conditions for server-configured Kubernetes custom-resource types."""
+async def get_k3s_configured_conditions(
+    limit_per_source: int = 50,
+    namespace: str | None = None,
+    name: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Conditions for server-configured Kubernetes custom-resource types.
+
+    Narrow with namespace, an exact object name, or a configured source name, so
+    looking one ExternalSecret up does not page every one in the cluster.
+    """
     return await asyncio.to_thread(
         _k3s_configured_conditions,
         limit_per_source,
+        namespace,
+        name,
+        source,
     )
+
+
+async def get_k3s_workloads(
+    namespace: str | None = None,
+    name: str | None = None,
+    kind: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Deployments, StatefulSets and DaemonSets with spec image and rollout state.
+
+    spec_images is what the workload asks for, which is a different fact from the
+    image a running pod reports: they diverge exactly when a rollout was applied
+    and has not landed. rollout_complete folds desired, ready, updated and
+    observedGeneration into the one answer. Incomplete rollouts sort first.
+    """
+    return await asyncio.to_thread(_k3s_workloads, namespace, name, kind, limit)
+
+
+async def get_k3s_storage_claims(
+    namespace: str | None = None, name: str | None = None, limit: int = 50
+) -> dict[str, Any]:
+    """PersistentVolumeClaims with phase, conditions, and their bound volume.
+
+    The lifecycle view beside get_k3s_volume_usage, which measures disk rather
+    than answering whether a claim bound. Unbound claims sort first.
+    """
+    return await asyncio.to_thread(_k3s_storage_claims, namespace, name, limit)
+
+
+async def get_k3s_events(
+    namespace: str | None = None,
+    kind: str | None = None,
+    name: str | None = None,
+    limit: int = 50,
+    max_age_hours: int = 24,
+) -> dict[str, Any]:
+    """Cluster events scoped to a namespace or one object, warnings first.
+
+    The object selector is the kubectl events --for shape: pass kind and name to
+    get only the events attached to that object.
+    """
+    return await asyncio.to_thread(_k3s_events, namespace, kind, name, limit, max_age_hours)
+
+
+async def get_k3s_namespaces(limit: int = 200) -> dict[str, Any]:
+    """Namespaces with phase, age, deletion timestamp, and finalizers.
+
+    A namespace stuck Terminating is readable here: the finalizers holding it are
+    on the record rather than inferred from the phase.
+    """
+    return await asyncio.to_thread(_k3s_namespaces, limit)
+
+
+async def get_k3s_network(
+    namespace: str | None = None, name: str | None = None, limit: int = 50
+) -> dict[str, Any]:
+    """Services, Ingresses and EndpointSlices for the routing path to a workload.
+
+    EndpointSlices carry ready_endpoint_count, which is how a Service that
+    resolves and answers nothing becomes visible. name also matches an
+    EndpointSlice by the Service it backs.
+    """
+    return await asyncio.to_thread(_k3s_network, namespace, name, limit)
+
+
+async def get_k3s_logs(
+    namespace: str,
+    pod: str,
+    container: str | None = None,
+    tail_lines: int = 200,
+    previous: bool = False,
+) -> dict[str, Any]:
+    """Bounded, redacted container logs for one pod.
+
+    previous=True reads the container that died rather than the one that replaced
+    it, which is where a crashloop explains itself. Output is capped at
+    NODE_STATS_K3S_LOG_MAX_BYTES, truncation is reported rather than silent, and
+    assignment-shaped secrets plus JWT, forge and AWS key literals are replaced
+    before the text leaves the cluster. Redaction is a backstop, not a guarantee:
+    a workload that prints a credential in an unrecognised shape still prints it.
+    """
+    return await asyncio.to_thread(_k3s_logs, namespace, pod, container, tail_lines, previous)
 
 
 def _allowed_roots() -> list[Path]:
@@ -3087,6 +3693,12 @@ for _tool in (
     get_k3s_scheduled_work,
     get_configured_freshness,
     get_k3s_configured_conditions,
+    get_k3s_workloads,
+    get_k3s_storage_claims,
+    get_k3s_events,
+    get_k3s_namespaces,
+    get_k3s_network,
+    get_k3s_logs,
     stat_path,
     read_text_head,
 ):

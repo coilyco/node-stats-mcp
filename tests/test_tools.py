@@ -1182,9 +1182,15 @@ def test_k3s_configured_conditions_uses_server_owned_resource_types(
     assert requested_paths == ["/apis/external-secrets.io/v1beta1/namespaces/ops/externalsecrets"]
     assert got["sources"][0]["items"][0]["ready"] == "False"
     assert got["sources"][0]["items"][0]["ready_condition_type"] == "Ready"
-    assert set(inspect.signature(server.get_k3s_configured_conditions).parameters) == {
-        "limit_per_source"
-    }
+    # A caller must not be able to name a resource type. The path assertion above
+    # is the proof; this names the forbidden parameters (node-stats-mcp#7965).
+    forbidden = {"group", "version", "resource", "path", "api", "url"}
+    parameters = set(inspect.signature(server.get_k3s_configured_conditions).parameters)
+    assert parameters & forbidden == set()
+
+    requested_paths.clear()
+    asyncio.run(server.get_k3s_configured_conditions(source="not-a-configured-source"))
+    assert requested_paths == []
 
 
 def test_k3s_pods_normalize_api_items(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1922,3 +1928,426 @@ def test_conntrack_healthy_read_carries_no_note(monkeypatch: pytest.MonkeyPatch,
     server = _load(monkeypatch, str(tmp_path), "")
 
     assert server.get_conntrack()["notes"] == []
+
+
+# --- k3s read surface (node-stats-mcp#7965) ---------------------------------
+# The recurring defect was projection, not access: the object was already held.
+
+
+def _pod_item(
+    name: str,
+    namespace: str,
+    containers: list[dict[str, Any]],
+    statuses: list[dict[str, Any]],
+    phase: str = "Running",
+    init_containers: list[dict[str, Any]] | None = None,
+    init_statuses: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {"nodeName": "kai-server", "containers": containers}
+    status: dict[str, Any] = {"phase": phase, "containerStatuses": statuses}
+    if init_containers is not None:
+        spec["initContainers"] = init_containers
+    if init_statuses is not None:
+        status["initContainerStatuses"] = init_statuses
+    return {
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "uid": f"uid-{name}",
+            "creationTimestamp": "2026-09-01T00:00:00Z",
+        },
+        "spec": spec,
+        "status": status,
+    }
+
+
+def test_k3s_pods_name_the_oom_kill_and_its_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminated container has to say why, or the tool cannot answer the question."""
+    server = _load(monkeypatch, "/", "")
+    item = _pod_item(
+        "worker-1",
+        "apps",
+        [{"name": "worker", "image": "registry/worker:abc"}],
+        [
+            {
+                "name": "worker",
+                "restartCount": 3,
+                "ready": False,
+                "state": {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 5m"}},
+                "lastState": {
+                    "terminated": {
+                        "reason": "OOMKilled",
+                        "exitCode": 137,
+                        "startedAt": "2026-09-19T23:00:00Z",
+                        "finishedAt": "2026-09-19T23:04:00Z",
+                    }
+                },
+            }
+        ],
+        phase="Running",
+    )
+    monkeypatch.setattr(server, "_k8s_list", lambda path: ([item], []))
+
+    container = server.get_k3s_pods(namespace="apps")["pods"][0]["containers"][0]
+
+    assert container["state_detail"]["type"] == "waiting"
+    assert container["state_detail"]["reason"] == "CrashLoopBackOff"
+    assert container["last_state"]["reason"] == "OOMKilled"
+    assert container["last_state"]["exit_code"] == 137
+    assert container["last_state"]["finished_at"] == "2026-09-19T23:04:00Z"
+
+
+def test_k3s_pods_name_the_image_that_could_not_be_pulled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    item = _pod_item(
+        "api-1",
+        "apps",
+        [{"name": "api", "image": "registry/api:missing"}],
+        [
+            {
+                "name": "api",
+                "restartCount": 0,
+                "ready": False,
+                "state": {
+                    "waiting": {
+                        "reason": "ImagePullBackOff",
+                        "message": "pull access denied for registry/api:missing",
+                    }
+                },
+            }
+        ],
+        phase="Pending",
+    )
+    monkeypatch.setattr(server, "_k8s_list", lambda path: ([item], []))
+
+    container = server.get_k3s_pods()["pods"][0]["containers"][0]
+
+    assert container["state_detail"]["reason"] == "ImagePullBackOff"
+    assert "registry/api:missing" in container["state_detail"]["message"]
+
+
+def test_k3s_pods_keep_init_containers_separate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Init:CrashLoopBackOff is its own diagnosis, and restart_count must not move."""
+    server = _load(monkeypatch, "/", "")
+    item = _pod_item(
+        "runner-0",
+        "forgejo",
+        [{"name": "runner", "image": "registry/runner:1"}],
+        [{"name": "runner", "restartCount": 1, "ready": True, "state": {"running": {}}}],
+        init_containers=[{"name": "register", "image": "registry/runner:1"}],
+        init_statuses=[
+            {
+                "name": "register",
+                "restartCount": 9,
+                "ready": False,
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+            }
+        ],
+    )
+    monkeypatch.setattr(server, "_k8s_list", lambda path: ([item], []))
+
+    pod = server.get_k3s_pods()["pods"][0]
+
+    assert pod["restart_count"] == 1
+    assert [c["name"] for c in pod["containers"]] == ["runner"]
+    assert pod["init_containers"][0]["name"] == "register"
+    assert pod["init_containers"][0]["state_detail"]["reason"] == "CrashLoopBackOff"
+
+
+def test_k3s_pods_narrow_at_the_api_and_sort_broken_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The namespace has to reach the request path, or one namespace pages the cluster."""
+    server = _load(monkeypatch, "/", "")
+    seen: list[str] = []
+    running = _pod_item("ok-1", "apps", [{"name": "c", "image": "i"}], [], phase="Running")
+    failed = _pod_item("bad-1", "apps", [{"name": "c", "image": "i"}], [], phase="Failed")
+
+    def fake_list(path: str) -> tuple[list[dict[str, Any]], list[str]]:
+        seen.append(path)
+        return [running, failed], []
+
+    monkeypatch.setattr(server, "_k8s_list", fake_list)
+
+    got = server.get_k3s_pods(namespace="apps", limit=1)
+
+    assert seen == ["/api/v1/namespaces/apps/pods"]
+    assert got["pod_count"] == 2
+    assert got["returned_pod_count"] == 1
+    assert got["pods"][0]["pod"] == "bad-1"
+
+
+def test_k3s_pods_reject_a_namespace_that_is_not_a_kubernetes_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    with pytest.raises(ValueError):
+        server.get_k3s_pods(namespace="apps/../../secrets")
+
+
+def test_k3s_workloads_report_spec_image_and_incomplete_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A green CD run proves an apply happened; this is what proves the image moved."""
+    server = _load(monkeypatch, "/", "")
+    deployment = {
+        "metadata": {
+            "name": "eco-app",
+            "namespace": "eco",
+            "generation": 7,
+            "creationTimestamp": "2026-09-01T00:00:00Z",
+        },
+        "spec": {
+            "replicas": 2,
+            "template": {"spec": {"containers": [{"name": "app", "image": "registry/eco:new"}]}},
+        },
+        "status": {
+            "observedGeneration": 7,
+            "readyReplicas": 1,
+            "updatedReplicas": 1,
+            "availableReplicas": 1,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_k8s_list",
+        lambda path: ([deployment], []) if path.endswith("deployments") else ([], []),
+    )
+
+    got = asyncio.run(server.get_k3s_workloads(namespace="eco"))
+    workload = got["workloads"][0]
+
+    assert workload["kind"] == "Deployment"
+    assert workload["spec_images"] == [{"container": "app", "image": "registry/eco:new"}]
+    assert workload["desired_replicas"] == 2
+    assert workload["rollout_complete"] is False
+
+
+def test_k3s_workloads_reject_an_unknown_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _load(monkeypatch, "/", "")
+    with pytest.raises(ValueError):
+        asyncio.run(server.get_k3s_workloads(kind="cronjob"))
+
+
+def test_k3s_events_scope_to_one_object_and_lead_with_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    now = "2099-01-01T00:00:00Z"
+
+    def event(reason: str, etype: str, name: str, kind: str = "Pod") -> dict[str, Any]:
+        return {
+            "metadata": {"namespace": "apps", "creationTimestamp": now},
+            "type": etype,
+            "reason": reason,
+            "message": reason,
+            "involvedObject": {"kind": kind, "namespace": "apps", "name": name},
+        }
+
+    items = [
+        event("Pulled", "Normal", "api-1"),
+        event("BackOff", "Warning", "api-1"),
+        event("Scheduled", "Normal", "other-1"),
+    ]
+    monkeypatch.setattr(server, "_k8s_list", lambda path: (items, []))
+
+    got = asyncio.run(server.get_k3s_events(namespace="apps", kind="pod", name="api-1"))
+
+    assert got["event_count"] == 2
+    assert got["events"][0]["reason"] == "BackOff"
+
+
+def test_k3s_storage_claims_lead_with_unbound_and_carry_the_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    bound = {
+        "metadata": {"name": "data-bound", "namespace": "apps"},
+        "spec": {"volumeName": "pv-1", "resources": {"requests": {"storage": "1Gi"}}},
+        "status": {"phase": "Bound", "capacity": {"storage": "1Gi"}},
+    }
+    pending = {
+        "metadata": {"name": "data-pending", "namespace": "apps"},
+        "spec": {"resources": {"requests": {"storage": "1Gi"}}},
+        "status": {"phase": "Pending"},
+    }
+    volume = {
+        "metadata": {"name": "pv-1"},
+        "spec": {"persistentVolumeReclaimPolicy": "Delete", "capacity": {"storage": "1Gi"}},
+        "status": {"phase": "Bound"},
+    }
+
+    def fake_list(path: str) -> tuple[list[dict[str, Any]], list[str]]:
+        if path.endswith("persistentvolumes"):
+            return [volume], []
+        return [bound, pending], []
+
+    monkeypatch.setattr(server, "_k8s_list", fake_list)
+
+    got = asyncio.run(server.get_k3s_storage_claims(namespace="apps"))
+
+    assert got["claims"][0]["persistent_volume_claim"] == "data-pending"
+    assert got["claims"][1]["persistent_volume_detail"]["reclaim_policy"] == "Delete"
+
+
+def test_k3s_namespaces_expose_the_finalizers_holding_a_terminating_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    item = {
+        "metadata": {
+            "name": "quire",
+            "creationTimestamp": "2026-09-01T00:00:00Z",
+            "deletionTimestamp": "2026-09-18T00:00:00Z",
+            "finalizers": ["kubernetes"],
+        },
+        "status": {"phase": "Terminating"},
+    }
+    monkeypatch.setattr(server, "_k8s_list", lambda path: ([item], []))
+
+    got = asyncio.run(server.get_k3s_namespaces())
+
+    assert got["namespaces"][0]["phase"] == "Terminating"
+    assert got["namespaces"][0]["finalizers"] == ["kubernetes"]
+
+
+def test_k3s_network_counts_ready_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Service that resolves and answers nothing is only visible at the slice."""
+    server = _load(monkeypatch, "/", "")
+    service = {
+        "metadata": {"name": "api", "namespace": "apps"},
+        "spec": {"type": "ClusterIP", "clusterIP": "10.43.0.1", "ports": [{"port": 80}]},
+    }
+    slice_item = {
+        "metadata": {
+            "name": "api-abc",
+            "namespace": "apps",
+            "labels": {"kubernetes.io/service-name": "api"},
+        },
+        "endpoints": [
+            {"conditions": {"ready": True}},
+            {"conditions": {"ready": False}},
+        ],
+        "ports": [{"port": 8080}],
+    }
+
+    def fake_list(path: str) -> tuple[list[dict[str, Any]], list[str]]:
+        if path.endswith("endpointslices"):
+            return [slice_item], []
+        if path.endswith("services"):
+            return [service], []
+        return [], []
+
+    monkeypatch.setattr(server, "_k8s_list", fake_list)
+
+    got = asyncio.run(server.get_k3s_network(namespace="apps", name="api"))
+    by_kind = {obj["kind"]: obj for obj in got["objects"]}
+
+    assert by_kind["EndpointSlice"]["endpoint_count"] == 2
+    assert by_kind["EndpointSlice"]["ready_endpoint_count"] == 1
+    assert by_kind["Service"]["cluster_ip"] == "10.43.0.1"
+
+
+def test_k3s_logs_redact_secrets_and_report_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    body = (
+        "starting worker\n"
+        "connecting with --api-key=s3cr3tvalue999\n"
+        "bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij\n"
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_text(path: str, params: dict[str, str], max_bytes: int) -> str:
+        captured["path"] = path
+        captured["params"] = params
+        return body
+
+    monkeypatch.setattr(server, "_k8s_request_text", fake_text)
+
+    got = asyncio.run(
+        server.get_k3s_logs(namespace="apps", pod="api-1", container="api", previous=True)
+    )
+
+    assert captured["path"] == "/api/v1/namespaces/apps/pods/api-1/log"
+    assert captured["params"]["previous"] == "true"
+    assert captured["params"]["container"] == "api"
+    joined = "\n".join(got["lines"])
+    assert "s3cr3tvalue999" not in joined
+    assert "eyJhbGciOiJIUzI1NiJ9" not in joined
+    assert joined.count("<REDACTED>") == 2
+    assert got["redaction_count"] == 2
+    assert got["truncated"] is False
+
+
+def test_k3s_logs_refuse_a_denied_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bound is config, so it has to be honoured before the request is made."""
+    server = _load(monkeypatch, "/", "")
+    monkeypatch.setattr(server, "_K3S_LOG_DENY_NAMESPACES", ("kube-system",))
+    monkeypatch.setattr(
+        server,
+        "_k8s_request_text",
+        lambda *a, **k: pytest.fail("a denied namespace must not reach the API"),
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(server.get_k3s_logs(namespace="kube-system", pod="etcd-0"))
+
+
+def test_k3s_logs_cap_the_tail_at_the_configured_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    monkeypatch.setattr(server, "_K3S_LOG_MAX_TAIL_LINES", 50)
+    captured: dict[str, Any] = {}
+
+    def fake_text(path: str, params: dict[str, str], max_bytes: int) -> str:
+        captured["params"] = params
+        return "line\n"
+
+    monkeypatch.setattr(server, "_k8s_request_text", fake_text)
+
+    asyncio.run(server.get_k3s_logs(namespace="apps", pod="api-1", tail_lines=100_000))
+
+    assert captured["params"]["tailLines"] == "50"
+
+
+def test_k3s_configured_conditions_narrow_to_one_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(
+        monkeypatch,
+        "/",
+        "",
+        k3s_condition_resources=json.dumps(
+            [
+                {
+                    "name": "external-secrets",
+                    "group": "external-secrets.io",
+                    "version": "v1",
+                    "resource": "externalsecrets",
+                }
+            ]
+        ),
+    )
+    items = [
+        {
+            "metadata": {"name": "forgejo-secrets", "namespace": "forgejo", "generation": 1},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        },
+        {
+            "metadata": {"name": "other", "namespace": "apps", "generation": 1},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        },
+    ]
+    monkeypatch.setattr(server, "_k8s_list", lambda path: (items, []))
+
+    got = asyncio.run(
+        server.get_k3s_configured_conditions(namespace="forgejo", name="forgejo-secrets")
+    )
+
+    assert got["sources"][0]["item_count"] == 1
+    assert got["sources"][0]["items"][0]["name"] == "forgejo-secrets"

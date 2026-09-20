@@ -5,10 +5,17 @@ diagnostics, with an OTLP exporter.
 
 ## Tools
 
-All read-only: 33 host and node tools in [host tools](tools-host.md) and 8
+All read-only: 33 host and node tools in [host tools](tools-host.md) and 14
 cluster tools in [k3s tools](tools-k3s.md), covering CPU, memory, disk,
 filesystem and PSI pressure, usage attribution, deleted open files, network,
-processes, and the k3s pod, volume, scheduling, and health views.
+processes, and the k3s pod, workload, storage, event, namespace, network,
+volume, scheduling, and health views.
+
+The cluster tools cover the read-only `kubectl` surface a live investigation
+reaches for: container failure reasons and exit codes, workload rollout state
+against the spec image, claim binding, object-scoped events, routing and ready
+endpoints, and bounded container logs. Every one narrows by namespace at the
+API rather than returning the cluster.
 
 A [networking surface](tools-network.md) covers connection tracking, TCP socket
 states, ephemeral port usage, and the node and pod DNS resolvers, with

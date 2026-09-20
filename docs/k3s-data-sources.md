@@ -13,3 +13,6 @@ Where the k3s tools read from, and what each falls back to.
 - Unattributed results are immediate children of the configured storage roots that no current PV path owns. They surface released or abandoned local-path data without guessing ownership.
 - Scheduled-work freshness comes from the batch/v1 Job and CronJob APIs.
 - Custom-resource condition sources come from `NODE_STATS_K3S_CONDITION_RESOURCES`, a JSON list of objects with `name`, `group`, `version`, `resource`, and optional `namespace`.
+- Pod, workload, claim, event, namespace, and network reads narrow by namespace at the API path rather than filtering a cluster-wide list locally. A selector is validated against the DNS-subdomain grammar before it is interpolated into a request path.
+- Workload reads come from the apps/v1 Deployment, StatefulSet, and DaemonSet APIs; network reads from core/v1 Services, networking.k8s.io/v1 Ingresses, and discovery.k8s.io/v1 EndpointSlices.
+- Container logs come from the core/v1 pod log subresource, which returns text rather than JSON, and are capped at the socket by `NODE_STATS_K3S_LOG_MAX_BYTES`.

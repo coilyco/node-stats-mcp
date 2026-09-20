@@ -12,14 +12,20 @@ True node stats need the pod to borrow the host's namespaces: **hostPID** so pro
 
 The server also exposes a read-only k3s inventory and health surface:
 
-- `get_k3s_pods` - namespace, pod, phase, node, restart count, container names/images, pod IP, age.
+- `get_k3s_pods` - namespace, pod, phase, node, restart count, container names/images, pod IP, age, plus each container's state detail and last state (OOMKilled and its exit code, ImagePullBackOff and the image, the termination behind a crashloop). Init containers listed separately. Narrows by namespace, name, or name prefix at the API.
 - `get_k3s_container_memory` - per-container memory from metrics-server when available, else approximate RSS summed from host cgroups.
 - `get_k3s_process_attribution` - top host processes annotated with the owning pod/container when cgroup data and pod metadata line up.
 - `get_k3s_resource_usage` - bounded kubelet Summary API usage for the selected node, system containers, pods, containers, volumes, and ephemeral storage.
 - `get_k3s_node_health` - node conditions, taints, capacity, and recent node-relevant or warning events.
 - `get_k3s_volume_usage` - bounded local-volume disk usage and lifecycle state joined to namespaces, PVCs, PVs, and pod/container mount paths, plus unattributed storage directories.
 - `get_k3s_scheduled_work` - Jobs and CronJobs with failures, activity, duration, and last-schedule or last-success timing.
-- `get_k3s_configured_conditions` - normalized conditions for custom-resource types selected by server configuration.
+- `get_k3s_configured_conditions` - normalized conditions for custom-resource types selected by server configuration, narrowed by namespace, object name, or configured source.
+- `get_k3s_workloads` - Deployments, StatefulSets, and DaemonSets with the spec image, replica counts, observedGeneration, and a folded `rollout_complete`.
+- `get_k3s_storage_claims` - PersistentVolumeClaims with phase, conditions, and their bound volume.
+- `get_k3s_events` - cluster events scoped to a namespace or one object by kind and name, warnings first.
+- `get_k3s_namespaces` - namespaces with phase, age, deletion timestamp, and finalizers.
+- `get_k3s_network` - Services, Ingresses, and EndpointSlices with ready endpoint counts.
+- `get_k3s_logs` - bounded, redacted container logs for one pod, with `previous` for the container that died.
 
 The API read path prefers the host-mounted k3s admin kubeconfig at `/host/etc/rancher/k3s/k3s.yaml` and falls back to the pod's service account when needed. Every tool stays read-only.
 
