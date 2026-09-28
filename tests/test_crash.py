@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
 import pytest
 import sentry_sdk
-from mcp import types
-from mcp.server.fastmcp import FastMCP
 from sentry_sdk.transport import Transport
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -99,27 +96,12 @@ def test_handled_errors_stay_out_of_sentry(captured: Any) -> None:
     assert captured.events == []
 
 
-def test_a_tool_that_raises_is_a_handled_error(captured: Any) -> None:
+def test_the_mcp_integration_annotates_with_pii_off(captured: Any) -> None:
     crash.init_crash_reporting("mcp_server")
-    app = FastMCP("crash-test")
-
-    @app.tool()
-    def boom() -> str:
-        raise RuntimeError("tool broke")
-
-    handler = app._mcp_server.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        method="tools/call", params=types.CallToolRequestParams(name="boom", arguments={})
-    )
-
-    async def call() -> types.ServerResult:
-        return await handler(request)
-
-    result = asyncio.run(call())
-    assert isinstance(result.root, types.CallToolResult)
-    assert result.root.isError
-    sentry_sdk.flush()
-    assert captured.events == []
+    client = sentry_sdk.get_client()
+    assert client.get_integration("mcp") is not None
+    # The MCP integration records tool arguments and results only with PII on.
+    assert client.options["send_default_pii"] is False
 
 
 def test_budget_caps_events_per_process_minute(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,17 +127,29 @@ def test_init_failure_logs_the_class_and_never_the_dsn(
     assert "secret-key" not in caplog.text
 
 
-def test_a_crash_reaches_sentry_without_its_frame_locals(captured: Any) -> None:
+def test_a_crash_keeps_locals_and_scrubs_process_data(captured: Any) -> None:
     secret = "-".join(["HOST", "SECRET"])
 
     async def crashed(request: Request) -> PlainTextResponse:
-        process_cmdline = (await request.json())["cmdline"]  # noqa: F841
+        sample = await request.json()
+        tool_name = sample["tool"]  # noqa: F841
+        cmdline = sample["cmdline"]  # noqa: F841
+        logging.getLogger("node_stats_mcp.test").warning("reading processes")
         raise RuntimeError("route crashed")
 
     assert crash.init_crash_reporting("mcp_server") is True
     app = Starlette(routes=[Route("/crash", crashed, methods=["POST"])])
     client = TestClient(app, raise_server_exceptions=False)
-    assert client.post("/crash", json={"cmdline": secret}).status_code == 500
+    body = {"tool": "get_top_processes", "cmdline": ["worker", "--token=" + secret]}
+    assert client.post("/crash", json=body).status_code == 500
     sentry_sdk.flush()
-    assert _values(captured) == ["route crashed"]
+    (event,) = captured.events
+    assert event["exception"]["values"][-1]["value"] == "route crashed"
+    frame_vars = event["exception"]["values"][-1]["stacktrace"]["frames"][-1]["vars"]
+    # Locals are what make the trace useful, so a harmless one stays readable.
+    assert "get_top_processes" in frame_vars["tool_name"]
     assert secret not in repr(captured.events)
+    crumbs = [crumb.get("message") for crumb in event["breadcrumbs"]["values"]]
+    assert "reading processes" in crumbs
+    assert event["request"]["method"] == "POST"
+    assert event["request"]["url"].endswith("/crash")

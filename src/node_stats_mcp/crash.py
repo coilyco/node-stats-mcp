@@ -1,8 +1,8 @@
-"""Crash reporting to Sentry, beside SigNoz, for crashes only.
+"""Crash reporting to Sentry, beside SigNoz: crashes only, fully annotated.
 
 Handled errors stay in SigNoz to keep inside Sentry's free quota
-(teable:coilyco/deploy#8347). A tool that raises is already a handled error,
-because FastMCP turns it into an error result.
+(teable:coilyco/deploy#8347). Every integration stays on to annotate a crash,
+and the scrubber takes the keys that hold process and host data.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
-from sentry_sdk.integrations.mcp import MCPIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
+from sentry_sdk.scrubber import DEFAULT_DENYLIST, EventScrubber
 
 if TYPE_CHECKING:
     from sentry_sdk.types import Event
@@ -24,6 +24,19 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 SENTRY_EVENTS_PER_MINUTE = 20
+
+# Frame locals and request bodies stay on to annotate a crash. These keys hold
+# process command lines and environments, which can carry secrets.
+USER_DATA_KEYS = [
+    "cmdline",
+    "argv",
+    "args",
+    "environ",
+    "env",
+    "command",
+    "body",
+    "payload",
+]
 _initialized = False
 _active = False
 _window: list[float] = []
@@ -59,19 +72,16 @@ def init_crash_reporting(component: str) -> bool:
             traces_sample_rate=0.0,
             environment=os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "homelab"),
             before_send=_before_send,
-            # Host process lists, paths and request bodies sit in frame locals.
-            include_local_variables=False,
-            max_request_body_size="never",
             send_default_pii=False,
+            event_scrubber=EventScrubber(
+                denylist=DEFAULT_DENYLIST + USER_DATA_KEYS, recursive=True
+            ),
             integrations=[
                 # Breadcrumbs only: an ERROR log is a handled error, kept in SigNoz.
                 LoggingIntegration(event_level=None),
                 # Only uncaught exceptions, never a 5xx response the server chose to send.
                 StarletteIntegration(failed_request_status_codes=set()),
             ],
-            # A tool that raises returns an error result to its caller, so it is
-            # handled, and the auto-enabled MCP integration would still send it.
-            disabled_integrations=[MCPIntegration()],
         )
         # The same image runs on two nodes, so the node tag keeps them apart.
         node = os.environ.get("NODE_STATS_K3S_NODE_NAME", "").strip() or socket.gethostname()
