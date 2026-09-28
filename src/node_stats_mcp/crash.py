@@ -59,6 +59,10 @@ def init_crash_reporting(component: str) -> bool:
             traces_sample_rate=0.0,
             environment=os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "homelab"),
             before_send=_before_send,
+            # Host process lists, paths and request bodies sit in frame locals.
+            include_local_variables=False,
+            max_request_body_size="never",
+            send_default_pii=False,
             integrations=[
                 # Breadcrumbs only: an ERROR log is a handled error, kept in SigNoz.
                 LoggingIntegration(event_level=None),

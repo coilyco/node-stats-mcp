@@ -143,3 +143,19 @@ def test_init_failure_logs_the_class_and_never_the_dsn(
         assert crash.init_crash_reporting("mcp_server") is False
     assert "ValueError" in caplog.text
     assert "secret-key" not in caplog.text
+
+
+def test_a_crash_reaches_sentry_without_its_frame_locals(captured: Any) -> None:
+    secret = "-".join(["HOST", "SECRET"])
+
+    async def crashed(request: Request) -> PlainTextResponse:
+        process_cmdline = (await request.json())["cmdline"]  # noqa: F841
+        raise RuntimeError("route crashed")
+
+    assert crash.init_crash_reporting("mcp_server") is True
+    app = Starlette(routes=[Route("/crash", crashed, methods=["POST"])])
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post("/crash", json={"cmdline": secret}).status_code == 500
+    sentry_sdk.flush()
+    assert _values(captured) == ["route crashed"]
+    assert secret not in repr(captured.events)
