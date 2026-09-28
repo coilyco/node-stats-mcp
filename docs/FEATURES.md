@@ -32,6 +32,13 @@ process, on fast and slow cadences, emitting stable metric dimensions and
 bounded structured logs over independent signals. See
 [OTLP export](otlp-export.md).
 
+## Crash reporting
+
+With `SENTRY_DSN` set, both processes also send crashes, and only crashes, to
+Sentry, tagged by node (`src/node_stats_mcp/crash.py`). A tool that raises
+returns an error result, so it counts as handled and stays out, as do error
+logs and deliberate 5xx responses (teable:coilyco/deploy#8347).
+
 ## Security and configuration
 
 Read-only by construction, an allowlisted read surface, and bounded traversal:

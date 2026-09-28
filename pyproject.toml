@@ -9,6 +9,7 @@ authors = [{ name = "Kai Ase Siren" }]
 dependencies = [
   "mcp>=1.14.0",
   "psutil>=6.0.0",
+  "sentry-sdk>=2.0,<3",
 ]
 
 [project.scripts]

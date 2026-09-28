@@ -41,6 +41,7 @@ import psutil
 from mcp.server.fastmcp import FastMCP
 
 from node_stats_mcp import storage
+from node_stats_mcp.crash import init_crash_reporting
 
 # Host root inside the pod. The deployment mounts the node's / read-only at
 # /host and sets ROOTFS=/host. Bare local runs leave it at / (the real root).
@@ -3709,6 +3710,7 @@ for _tool in (
 
 def main() -> None:
     """Run the MCP server over streamable-HTTP (endpoint served at /mcp)."""
+    init_crash_reporting("mcp_server")
     mcp.run(transport="streamable-http")
 
 

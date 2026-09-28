@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from node_stats_mcp import server
+from node_stats_mcp.crash import init_crash_reporting
 from node_stats_mcp.otlp import (
     AttributeValue,
     LogRecord,
@@ -933,6 +934,7 @@ async def run_exporter(
 
 def main() -> None:
     """CLI entrypoint for the same-image exporter sidecar."""
+    init_crash_reporting("exporter")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="collect and export one cycle")
     parser.add_argument(
