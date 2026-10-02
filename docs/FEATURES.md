@@ -32,6 +32,13 @@ process, on fast and slow cadences, emitting stable metric dimensions and
 bounded structured logs over independent signals. See
 [OTLP export](otlp-export.md).
 
+## Not-Ready alerting
+
+The exporter sends one Sentry event for each configured Kubernetes resource
+whose Ready condition has stayed false past a grace period, and again each
+hour while it does, tagged `alert=true` for the fleet-heartbeats rule. See
+[not-ready alerting](not-ready-alerting.md).
+
 ## Crash reporting
 
 With `SENTRY_DSN` set, both processes also send crashes, and only crashes, to

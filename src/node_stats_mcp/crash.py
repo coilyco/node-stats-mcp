@@ -42,6 +42,11 @@ _active = False
 _window: list[float] = []
 
 
+def node_name() -> str:
+    """The node this process reads, since the same image runs on two nodes."""
+    return os.environ.get("NODE_STATS_K3S_NODE_NAME", "").strip() or socket.gethostname()
+
+
 def _within_budget(now: float) -> bool:
     """Cap events per process so one crash loop cannot spend the monthly quota."""
     cutoff = now - 60.0
@@ -83,9 +88,7 @@ def init_crash_reporting(component: str) -> bool:
                 StarletteIntegration(failed_request_status_codes=set()),
             ],
         )
-        # The same image runs on two nodes, so the node tag keeps them apart.
-        node = os.environ.get("NODE_STATS_K3S_NODE_NAME", "").strip() or socket.gethostname()
-        sentry_sdk.set_tag("node", node)
+        sentry_sdk.set_tag("node", node_name())
         sentry_sdk.set_tag("component", component)
     except Exception as exc:
         # The class only: a BadDsn message can carry the DSN itself.

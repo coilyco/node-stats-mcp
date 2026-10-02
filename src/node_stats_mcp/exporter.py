@@ -16,6 +16,8 @@ from typing import Any
 
 from node_stats_mcp import server
 from node_stats_mcp.crash import init_crash_reporting
+from node_stats_mcp.notready import NotReadyWatch, sender_from_env
+from node_stats_mcp.notready import load_config as load_notready_config
 from node_stats_mcp.otlp import (
     AttributeValue,
     LogRecord,
@@ -58,6 +60,7 @@ class CycleResult:
     metrics_status: int | None
     logs_status: int | None
     errors: tuple[str, ...]
+    not_ready_events: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -814,11 +817,17 @@ async def run_cycle(
     include_volume: bool,
     dry_run: bool = False,
     post: PostJson = post_json,
+    watch: NotReadyWatch | None = None,
 ) -> CycleResult:
     """Run one collection and independently export its metrics and source logs."""
     started = time.monotonic()
     snapshots = await collect_sources(config.limit, include_volume=include_volume)
     duration = time.monotonic() - started
+    # Before the OTLP post, so a collector that is down cannot silence the alert.
+    not_ready_events = 0
+    conditions = snapshots.get("conditions", {})
+    if watch is not None and not dry_run and "collection_error" not in conditions:
+        not_ready_events = watch.observe(conditions)
     observed_at = time.time_ns()
     resource = _resource_attributes()
     points = metric_points(snapshots, cycle_duration_seconds=duration)
@@ -877,6 +886,7 @@ async def run_cycle(
         metrics_status=statuses[0],
         logs_status=statuses[1],
         errors=tuple(errors),
+        not_ready_events=not_ready_events,
     )
 
 
@@ -894,6 +904,7 @@ def _report(result: CycleResult, *, dry_run: bool) -> None:
         "metrics_status": result.metrics_status,
         "logs_status": result.logs_status,
         "errors": result.errors,
+        "not_ready_events": result.not_ready_events,
     }
     print(
         json.dumps(payload, separators=(",", ":")),
@@ -911,6 +922,11 @@ async def run_exporter(
 ) -> bool:
     """Run non-overlapping fast cycles and a slower local-volume cadence."""
     last_volume_at: float | None = None
+    sender = None if dry_run else sender_from_env()
+    watch = NotReadyWatch(load_notready_config(), sender) if sender else None
+    if watch is None and not dry_run:
+        off = {"event": "node_stats_not_ready_alerting", "status": "off", "why": "no alert DSN"}
+        print(json.dumps(off), file=sys.stderr, flush=True)
     while True:
         cycle_started = time.monotonic()
         include_volume = (
@@ -922,6 +938,7 @@ async def run_exporter(
             include_volume=include_volume,
             dry_run=dry_run,
             post=post,
+            watch=watch,
         )
         if include_volume:
             last_volume_at = cycle_started
