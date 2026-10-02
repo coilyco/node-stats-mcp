@@ -39,6 +39,12 @@ whose Ready condition has stayed false past a grace period, and again each
 hour while it does, tagged `alert=true` for the fleet-heartbeats rule. See
 [not-ready alerting](not-ready-alerting.md).
 
+## Exporter health endpoint
+
+With `NODE_STATS_HEALTH_PORT` set, the exporter serves `GET /healthz` with the
+age of its last filesystem collection, for a Gatus probe. See
+[exporter health](exporter-health.md).
+
 ## Crash reporting
 
 With `SENTRY_DSN` set, both processes also send crashes, and only crashes, to

@@ -98,6 +98,7 @@ large-upload publisher paths.
 - [docs/security.md](docs/security.md) - what the host namespaces buy and what they cost.
 - [docs/configuration.md](docs/configuration.md) - environment, roots, and scan limits.
 - [docs/not-ready-alerting.md](docs/not-ready-alerting.md) - Sentry events for resources that stay not Ready.
+- [docs/exporter-health.md](docs/exporter-health.md) - the `/healthz` endpoint a Gatus probe reads.
 - [docs/signoz-export.md](docs/signoz-export.md) - bounded OTLP metrics and structured logs.
 - [docs/host-storage.md](docs/host-storage.md) - mount-aware host usage, log, and deleted-file attribution.
 - [.ward/ward.yaml](.ward/ward.yaml) - allowlisted commands + catalog block.
