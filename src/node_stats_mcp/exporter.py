@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from node_stats_mcp import server
-from node_stats_mcp.crash import init_crash_reporting
+from node_stats_mcp.crash import init_crash_reporting, node_name
+from node_stats_mcp.health import Heartbeat, start_health_server
 from node_stats_mcp.notready import NotReadyWatch, sender_from_env
 from node_stats_mcp.notready import load_config as load_notready_config
 from node_stats_mcp.otlp import (
@@ -44,6 +45,7 @@ class ExportConfig:
     max_payload_bytes: int
     max_metric_points: int
     timeout_seconds: float
+    health_port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,20 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     return max(minimum, min(value, maximum))
 
 
+def _health_port() -> int | None:
+    """The health endpoint's port, or None when it is off. A bad value stops start."""
+    raw = os.environ.get("NODE_STATS_HEALTH_PORT", "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise ValueError("NODE_STATS_HEALTH_PORT must be a port from 1 to 65535")
+    return port
+
+
 def load_config(*, require_endpoint: bool = True) -> ExportConfig:
     """Load the exporter configuration without allowing unbounded work."""
     endpoint = os.environ.get("NODE_STATS_OTLP_ENDPOINT", "").strip()
@@ -129,6 +145,7 @@ def load_config(*, require_endpoint: bool = True) -> ExportConfig:
             5_000,
         ),
         timeout_seconds=_bounded_float("NODE_STATS_OTLP_TIMEOUT_SECONDS", 5.0, 1.0, 30.0),
+        health_port=_health_port(),
     )
 
 
@@ -818,11 +835,15 @@ async def run_cycle(
     dry_run: bool = False,
     post: PostJson = post_json,
     watch: NotReadyWatch | None = None,
+    heartbeat: Heartbeat | None = None,
 ) -> CycleResult:
     """Run one collection and independently export its metrics and source logs."""
     started = time.monotonic()
     snapshots = await collect_sources(config.limit, include_volume=include_volume)
     duration = time.monotonic() - started
+    filesystem = snapshots.get("filesystem")
+    if heartbeat is not None and filesystem is not None and "collection_error" not in filesystem:
+        heartbeat.beat()
     # Before the OTLP post, so a collector that is down cannot silence the alert.
     not_ready_events = 0
     conditions = snapshots.get("conditions", {})
@@ -913,6 +934,18 @@ def _report(result: CycleResult, *, dry_run: bool) -> None:
     )
 
 
+def _serve_health(port: int, heartbeat: Heartbeat) -> None:
+    """Start the health endpoint. A bind failure must not take the exporter down."""
+    try:
+        start_health_server("0.0.0.0", port, node_name(), heartbeat)
+        status: dict[str, object] = {"status": "on", "port": port}
+    except OSError as exc:
+        status = {"status": "error", "port": port, "why": f"{type(exc).__name__}: {exc}"[:200]}
+    print(
+        json.dumps({"event": "node_stats_health_endpoint", **status}), file=sys.stderr, flush=True
+    )
+
+
 async def run_exporter(
     config: ExportConfig,
     *,
@@ -922,6 +955,9 @@ async def run_exporter(
 ) -> bool:
     """Run non-overlapping fast cycles and a slower local-volume cadence."""
     last_volume_at: float | None = None
+    heartbeat = Heartbeat()
+    if config.health_port is not None and not (once or dry_run):
+        _serve_health(config.health_port, heartbeat)
     sender = None if dry_run else sender_from_env()
     watch = NotReadyWatch(load_notready_config(), sender) if sender else None
     if watch is None and not dry_run:
@@ -939,6 +975,7 @@ async def run_exporter(
             dry_run=dry_run,
             post=post,
             watch=watch,
+            heartbeat=heartbeat,
         )
         if include_volume:
             last_volume_at = cycle_started
