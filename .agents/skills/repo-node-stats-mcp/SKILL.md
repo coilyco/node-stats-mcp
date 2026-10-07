@@ -5,7 +5,7 @@ description: Read-only MCP for Linux and Kubernetes diagnostics with bounded hos
 
 # repo-node-stats-mcp
 
-Pointer to `~/projects/coilyco-flight-deck/node-stats-mcp/`.
+Pointer to `~/projects/coilyco/node-stats-mcp/`.
 
 - [`README.md`](../../../README.md) - what it is, quickstart, layout.
 - [`AGENTS.md`](../../../AGENTS.md) - agent-facing operating context for the repo.
