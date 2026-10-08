@@ -37,7 +37,7 @@ Route every command through just, never bare `uv` / `pytest`. Verbs are declared
 The image is published privately to
 `forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>` by
 [`.forgejo/workflows/build-publish.yml`](.forgejo/workflows/build-publish.yml)
-on every push to main. The trusted publisher uses a package-write credential.
+on every push to main. The `test` job also runs on pull requests to main, and `publish` never does. The trusted publisher uses a package-write credential.
 The deploy repo receives only the package-read credential and rolls the same
 immutable reference. Keep the dependency surface tiny (psutil + mcp). A new
 dependency needs a reason.
