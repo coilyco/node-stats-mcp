@@ -49,10 +49,14 @@ dev = [
   "pre-commit>=4.5.1",
   "ruff>=0.15.10",
   "pytest>=8.0.0",
+  "playwright>=1.63,<2",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The browser check needs a downloaded Chromium, so `just check-views` selects it.
+addopts = "-m 'not browser'"
+markers = ["browser: renders the MCP Apps views in a real browser (just check-views)"]
 
 # Per-repo opt-outs for agentic-os pre-commit hooks (agentic_os/config.py).
 

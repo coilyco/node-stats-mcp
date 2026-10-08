@@ -17,8 +17,10 @@ The seam is `TOOL_VIEWS` in [views/\_\_init\_\_.py](../src/node_stats_mcp/views/
 ## Checking it
 
 * **Tests** drive a real in-memory client session: `_meta.ui.resourceUri` on the two tools and no others, `resources/read` returning the right MIME type, the thresholds in the page, and the text result unchanged.
-* **The View itself** needs a browser. Render it in the ext-apps reference host (`examples/basic-host`) against a local run of the server. A browser host calls the server from the page, and this server sends no CORS headers on purpose, so put a CORS shim in front for the test. The aterm gateway reaches servers from the daemon and needs none.
-* **Not covered by a committed check:** the View's rendering. COI-2503 tracks adding one.
+* **The View itself** runs in a real browser: `just browser-install` once, then `just check-views`. CI runs both before it publishes. [test_views_browser.py](../tests/test_views_browser.py) is a stand-in host page that embeds each View's HTML from `resources/read` in a sandboxed iframe under `default-src 'none'`, answers `ui/initialize` and `tools/call`, and sends `tool-result`. It asserts on the DOM: the handshake, drawing from `structuredContent` and from the text block, the disk dedupe and the "N of M mounts reported no usage" line, the warning and critical states, the table view, theme from the host and from the OS, `size-changed`, and the error and cancelled messages. Any console error, page error, or request beyond the host page fails the run, so a CSP violation cannot pass quietly. The run is deselected from `just test` by the `browser` marker because it needs a downloaded Chromium, and a missing browser fails it rather than skipping.
+* **Playwright is a dev-group dependency only.** The wheel carries its own driver, so the image needs no Node, and the production image installs with `--no-dev`. Chromium comes from `playwright install` at job time (about 115 MiB), not from the shared dev-base image.
+
+A new view adds one entry to `VIEW_FIXTURES` in that file, a callable returning the tool's `structuredContent` shaped like live output. `test_every_declared_view_has_a_fixture` fails and names any declared view without one, and every fixture runs the handshake, table view, and theme tests with no further edit. A View that resamples a counter asks the stand-in host with `tools/call`, answered from `Host.tool_results(name, [result, ...])`.
 
 ## Version floor
 
