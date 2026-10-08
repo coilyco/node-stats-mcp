@@ -24,7 +24,7 @@ Route every command through just, never bare `uv` / `pytest`. Verbs are declared
 
 ## Validation
 
-`just lint` (ruff + ruff-format + mypy) and `just test` (pytest). `just precommit` runs the full pre-commit suite, including the agentic-os catalog hooks. Validate before pushing.
+`just lint` (ruff + ruff-format + mypy) and `just test` (pytest). `just check-views` renders the MCP Apps views in a real browser (needs `just browser-install` once). `just precommit` runs the full pre-commit suite, including the agentic-os catalog hooks. Validate before pushing.
 
 ## Safety
 

@@ -27,6 +27,14 @@ test *ARGS:
 lint *ARGS:
     @bash scripts/ward-quality.sh check "$@"
 
+# Download the Chromium that check-views drives (--with-deps adds its system libraries on Linux).
+browser-install *ARGS:
+    @uv run playwright install {{ if os() == "linux" { "--with-deps" } else { "" } }} chromium "$@"
+
+# Render the disk and memory MCP Apps views in a real browser and assert on the DOM.
+check-views *ARGS:
+    @uv run pytest -m browser "$@"
+
 # Apply ruff fixes and formatting in place.
 fmt *ARGS:
     @bash scripts/ward-quality.sh format "$@"
