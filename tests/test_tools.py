@@ -348,10 +348,14 @@ def test_pressure_path_usage_reports_timeout(
         du_timeout_seconds="0.001",
     )
     original_scandir = server.os.scandir
+    # A frozen clock, so the 1 ms discovery slice cannot lapse on a slow first scandir
+    # (a cold CI filesystem did, leaving no children). Only the child scan overruns.
+    now = [0.0]
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
 
     def slow_scandir(path):
         if Path(path).name == "large":
-            time.sleep(0.02)
+            now[0] += 0.02
         return original_scandir(path)
 
     monkeypatch.setattr(server.os, "scandir", slow_scandir)
