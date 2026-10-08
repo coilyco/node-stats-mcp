@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 from collections import namedtuple
 from collections.abc import Awaitable, Callable
@@ -45,24 +46,36 @@ def _ui_uri(tool: Any) -> str | None:
     return ((tool.meta or {}).get("ui") or {}).get("resourceUri")
 
 
-def test_disk_and_memory_tools_declare_their_view(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = _load(monkeypatch)
-
+def _declared(server: ModuleType) -> dict[str, str]:
     async def body(client: ClientSession) -> dict[str, str | None]:
         return {t.name: _ui_uri(t) for t in (await client.list_tools()).tools}
 
-    declared = _with_client(server, body)
+    return {name: uri for name, uri in _with_client(server, body).items() if uri}
 
+
+def test_every_view_tool_declares_its_view_and_no_other_tool_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from node_stats_mcp import views
+
+    server = _load(monkeypatch)
+
+    declared = _declared(server)
+
+    # tools/list is what a host sees. A tool missing here is text-only, which is
+    # the right state for every tool the table does not name.
+    assert declared == views.TOOL_VIEWS
     assert declared["get_disk_info"] == "ui://node-stats/disk"
     assert declared["get_memory_info"] == "ui://node-stats/memory"
-    # Every other tool stays text-only: a host that sees no _meta.ui draws nothing.
-    assert {n for n, uri in declared.items() if uri} == {"get_disk_info", "get_memory_info"}
+    assert len(set(declared.values())) == len(declared)
 
 
 def test_every_declared_view_is_a_listed_resource_that_reads_as_mcp_app_html(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = _load(monkeypatch)
+
+    expected = set(_declared(server).values())
 
     async def body(client: ClientSession) -> tuple[set[str], dict[str, list[Any]], dict[str, str]]:
         uris = {u for t in (await client.list_tools()).tools if (u := _ui_uri(t))}
@@ -72,7 +85,8 @@ def test_every_declared_view_is_a_listed_resource_that_reads_as_mcp_app_html(
 
     uris, reads, listed_mime = _with_client(server, body)
 
-    assert uris == {"ui://node-stats/disk", "ui://node-stats/memory"}
+    assert uris == expected
+    assert len(uris) >= 10
     for uri in uris:
         assert listed_mime[uri] == MIME
         (content,) = reads[uri]
@@ -99,13 +113,33 @@ def test_view_carries_the_servers_own_thresholds_not_a_copy_of_them(
     assert '"criticalPercent": 90.0' in html
 
 
+def test_each_view_names_its_own_kind_and_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One shell serves every view, so the baked-in config is all that tells them apart."""
+    server = _load(monkeypatch)
+    declared = _declared(server)
+
+    async def body(client: ClientSession) -> dict[str, str]:
+        out = {}
+        for tool, uri in declared.items():
+            (content,) = (await client.read_resource(AnyUrl(uri))).contents
+            assert isinstance(content, TextResourceContents)
+            out[tool] = content.text
+        return out
+
+    for tool, html in _with_client(server, body).items():
+        kind = declared[tool].rsplit("/", 1)[1]
+        assert f'"kind": "{kind}"' in html
+        assert f'"tool": "{tool}"' in html
+
+
 def test_view_asks_the_network_for_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """The spec's default CSP is connect-src 'none' and no external scripts or styles."""
     server = _load(monkeypatch)
+    uris = sorted(_declared(server).values())
 
     async def body(client: ClientSession) -> list[str]:
         out = []
-        for uri in ("ui://node-stats/disk", "ui://node-stats/memory"):
+        for uri in uris:
             (content,) = (await client.read_resource(AnyUrl(uri))).contents
             assert isinstance(content, TextResourceContents)
             out.append(content.text)
@@ -136,3 +170,35 @@ def test_text_result_is_unchanged_and_is_what_the_view_reads(
     assert json.loads(block.text) == server.get_memory_info()
     assert result.structuredContent == server.get_memory_info()
     assert not result.isError
+
+
+def test_every_view_tool_keeps_its_text_result_and_structured_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declaring a view must not change what a host without MCP Apps receives."""
+    server = _load(monkeypatch)
+    # No cluster here, so the k3s tools run their no-API path: empty lists plus errors.
+    monkeypatch.setattr(server, "_k8s_list", lambda path: ([], []))
+    tools = sorted(_declared(server))
+
+    async def body(client: ClientSession) -> dict[str, tuple[Any, Any]]:
+        out = {}
+        for name in tools:
+            direct = getattr(server, name)()
+            if inspect.isawaitable(direct):
+                direct = await direct
+            out[name] = (await client.call_tool(name, {}), direct)
+        return out
+
+    results = _with_client(server, body)
+
+    assert len(results) >= 10
+    for name, (result, direct) in results.items():
+        assert not result.isError, name
+        (block,) = result.content
+        assert isinstance(block, TextContent)
+        text_payload = json.loads(block.text)
+        assert isinstance(text_payload, dict), name
+        assert result.structuredContent == text_payload, name
+        # Same keys as a direct call. The values drift between calls.
+        assert set(text_payload) == set(direct), name

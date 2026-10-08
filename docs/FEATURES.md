@@ -27,7 +27,7 @@ through the event it was meant to catch.
 
 ## MCP Apps views
 
-`get_disk_info` and `get_memory_info` declare `ui://` chart views that a host speaking MCP Apps renders, with the server's own disk thresholds baked in. Every other host keeps the unchanged text result. See [MCP Apps views](mcp-apps-views.md).
+Ten tools declare `ui://` views that a host speaking MCP Apps renders: disk, memory, system snapshot, CPU, filesystem pressure, network, conntrack, and the k3s pods, workloads, and node health. The network and conntrack views can resample counters through the host to show movement. Every other host keeps the unchanged text result. See [MCP Apps views](mcp-apps-views.md) and [the node and k3s views](mcp-apps-views-node.md).
 
 ## OTLP export
 
