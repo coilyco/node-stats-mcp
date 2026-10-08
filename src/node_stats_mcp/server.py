@@ -29,6 +29,7 @@ import stat
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -3710,28 +3711,28 @@ for _tool in (
     mcp.tool(meta=views.tool_meta(_tool.__name__))(_tool)
 
 
-def disk_view() -> str:
-    """Disk usage chart for get_disk_info (MCP Apps view)."""
-    return views.render(
-        views.DISK_URI, warn_percent=_DISK_WARN_PERCENT, critical_percent=_DISK_CRITICAL_PERCENT
-    )
+def _view_page(kind: str) -> Callable[[], str]:
+    def page() -> str:
+        return views.render(
+            views.uri_for(kind),
+            warn_percent=_DISK_WARN_PERCENT,
+            critical_percent=_DISK_CRITICAL_PERCENT,
+        )
 
-
-def memory_view() -> str:
-    """Memory and swap chart for get_memory_info (MCP Apps view)."""
-    return views.render(
-        views.MEMORY_URI, warn_percent=_DISK_WARN_PERCENT, critical_percent=_DISK_CRITICAL_PERCENT
-    )
+    page.__name__ = f"{kind.replace('-', '_')}_view"
+    page.__doc__ = f"MCP Apps view for the {kind} tool result."
+    return page
 
 
 # prefersBorder false: the host's own panel already frames the view.
-for _uri, _view in ((views.DISK_URI, disk_view), (views.MEMORY_URI, memory_view)):
+for _kind in dict.fromkeys(views.TOOL_KINDS.values()):
+    _page = _view_page(_kind)
     mcp.resource(
-        _uri,
-        name=_view.__name__,
+        views.uri_for(_kind),
+        name=_page.__name__,
         mime_type=views.RESOURCE_MIME_TYPE,
         meta={"ui": {"prefersBorder": False}},
-    )(_view)
+    )(_page)
 
 
 def main() -> None:

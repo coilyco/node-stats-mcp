@@ -74,6 +74,18 @@ table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px
 th, td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--grid); overflow-wrap: anywhere; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 #status { color: var(--ink-2); }
+.cores { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0 16px; }
+.cores .row { margin-bottom: 10px; }
+.items { list-style: none; margin: 0 0 16px; padding: 0; }
+.items li { padding: 6px 0; border-bottom: 1px solid var(--grid); overflow-wrap: anywhere; }
+.items .bad { font-weight: 600; }
+.live { margin: 0 0 16px; padding-top: 8px; border-top: 1px solid var(--grid); }
+.live h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.live button { font: inherit; font-size: 12px; padding: 4px 12px; margin-right: 8px; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; cursor: pointer; }
+.spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 22px; width: 120px; vertical-align: middle; margin-right: 8px; }
+.spark > i { display: block; flex: 1 1 0; min-height: 1px; background: var(--series); }
+.moved { font-weight: 600; }
+caption { text-align: left; color: var(--ink-2); font-size: 12px; padding-top: 8px; }
 </style>
 </head>
 <body>
@@ -205,12 +217,396 @@ function renderMemory(data) {
   return out;
 }
 
+function num(n) { return typeof n === "number" && isFinite(n) ? n.toLocaleString("en-US") : "n/a"; }
+function duration(seconds) {
+  if (typeof seconds !== "number" || !isFinite(seconds)) return "n/a";
+  const d = Math.floor(seconds / 86400), hr = Math.floor((seconds % 86400) / 3600), m = Math.floor((seconds % 3600) / 60);
+  return d ? `${d}d ${hr}h` : hr ? `${hr}h ${m}m` : `${m}m`;
+}
+function fixed(n, digits) { return typeof n === "number" && isFinite(n) ? n.toFixed(digits) : "n/a"; }
+
+function bar(width, cls, ticks) {
+  return h("div", { class: "bar", "aria-hidden": "true" },
+    h("i", { class: "fill" + (cls ? " " + cls : ""), style: `flex: 0 0 ${clamp(width)}%` }),
+    h("i", { class: "rest" }),
+    (ticks || []).map(t => h("i", { class: "tick", style: `left: ${clamp(t)}%` })));
+}
+
+// One labelled bar. The aria-label carries the whole reading, so no value rests on the bar alone.
+function gauge(name, sub, valueText, width, detail, cls, ticks) {
+  const row = h("div", { class: "row" },
+    h("div", { class: "row-head" },
+      h("div", {}, h("div", { class: "name" }, name), sub ? h("div", { class: "sub" }, sub) : null),
+      h("div", { class: "value" }, valueText)),
+    bar(width, cls, ticks));
+  row.setAttribute("role", "img");
+  row.setAttribute("tabindex", "0");
+  row.setAttribute("aria-label", detail);
+  return row;
+}
+
+function hero(big, text) { return h("div", { class: "hero" }, h("b", {}, big), h("span", {}, text)); }
+function note(text) { return h("p", { class: "note" }, text); }
+function errorsNote(errors) {
+  return Array.isArray(errors) && errors.length ? note("The tool reported errors: " + errors.join("; ")) : null;
+}
+
+function renderSystem(data) {
+  const m = data.memory || {};
+  const load = Array.isArray(data.load_avg_1_5_15) ? data.load_avg_1_5_15 : [];
+  const users = Array.isArray(data.logged_in_users) ? data.logged_in_users : [];
+  const inUse = typeof m.available === "number" ? m.total - m.available : m.used;
+  const out = [hero(pct(data.cpu_percent), "of CPU in use, sampled over a fraction of a second")];
+  out.push(gauge("CPU", null, pct(data.cpu_percent), data.cpu_percent || 0, "CPU: " + pct(data.cpu_percent) + " in use"));
+  out.push(stackedRow("Memory", m.total, inUse, "in use", "available", m.percent));
+  out.push(h("div", { class: "row" },
+    h("div", { class: "row-head" }, h("div", { class: "name" }, "Load average"),
+      h("div", { class: "value" }, load.map(n => fixed(n, 2)).join(" / ") + " (1, 5, 15 min)"))));
+  out.push(note("Load has no scale of its own until it meets the core count. get_cpu_info charts it against the cores."));
+  out.push(h("div", { class: "row" },
+    h("div", { class: "row-head" }, h("div", { class: "name" }, "Uptime"),
+      h("div", { class: "value" }, duration(data.uptime_seconds) + ", booted " + (typeof data.boot_time_epoch === "number" ? new Date(data.boot_time_epoch * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC" : "n/a")))));
+  out.push(note(users.length ? users.length + " logged in: " + users.map(u => u.name + (u.host ? "@" + u.host : "")).join(", ") : "No logged-in users."));
+  out.push(table(["Field", "Value"], [
+    ["CPU", pct(data.cpu_percent)], ["Memory in use", pct(m.percent)], ["Memory total", bytes(m.total)],
+    ["Load 1 min", fixed(load[0], 2)], ["Load 5 min", fixed(load[1], 2)], ["Load 15 min", fixed(load[2], 2)],
+    ["Uptime", duration(data.uptime_seconds)], ["Logged-in users", String(users.length)],
+  ]));
+  return out;
+}
+
+function renderCpu(data) {
+  const cores = Array.isArray(data.per_core_percent) ? data.per_core_percent : [];
+  const load = Array.isArray(data.load_avg_1_5_15) ? data.load_avg_1_5_15 : [];
+  const logical = data.logical_cores;
+  const out = [hero(pct(data.percent), `of CPU in use across ${logical || "n/a"} logical cores${data.physical_cores ? " (" + data.physical_cores + " physical)" : ""}`)];
+  out.push(h("div", { class: "cores" }, cores.map((p, i) =>
+    gauge("Core " + i, null, pct(p), p, `Core ${i}: ${pct(p)} in use`))));
+  const labels = ["1 min", "5 min", "15 min"];
+  load.forEach((l, i) => {
+    const per = logical > 0 ? (l / logical) * 100 : 0;
+    out.push(gauge("Load " + labels[i], null, `${fixed(l, 2)} on ${logical || "n/a"} cores`, Math.min(per, 100),
+      `Load over ${labels[i]}: ${fixed(l, 2)} on ${logical || "n/a"} logical cores, ${fixed(per, 0)}% of one runnable task per core`, null, [100]));
+  });
+  out.push(note("A full bar is one runnable task per logical core. On Linux the load figure also counts tasks waiting on disk."));
+  out.push(table(["Field", "Value"], [
+    ["CPU", pct(data.percent)], ["Logical cores", num(logical)], ["Physical cores", num(data.physical_cores)],
+    ...load.map((l, i) => ["Load " + labels[i], fixed(l, 2)]),
+    ...cores.map((p, i) => ["Core " + i, pct(p)]),
+  ]));
+  return out;
+}
+
+function renderPressure(data) {
+  const r = data.root || {};
+  const warn = r.warn_percent, crit = r.critical_percent;
+  const sev = r.status === "critical" ? "critical" : r.status === "warning" ? "warning" : null;
+  const detail = `${r.path || "/"}: ${pct(r.used_percent)} used, ${bytes(r.pressure_used_bytes)} of ${bytes(r.total_bytes)}, status ${r.status}`;
+  const out = [hero(pct(r.used_percent), "of the root filesystem used at " + (r.path || "/"))];
+  const row = gauge("Root filesystem", bytes(r.available_bytes) + " available to non-root", `${pct(r.used_percent)} // ${bytes(r.pressure_used_bytes)} of ${bytes(r.total_bytes)}`,
+    r.used_percent || 0, detail + (sev ? ", " + sev : ""), sev === "critical" ? "crit" : sev === "warning" ? "warn" : null, [warn, crit]);
+  if (sev) row.append(h("div", { class: "flag" }, (sev === "critical" ? "✕ Critical" : "▲ Warning") + `: at or above ${sev === "critical" ? crit : warn}%`));
+  out.push(row);
+  const runway = (label, until, over, limit) => until > 0 ? `${bytes(until)} until ${label} (${limit}%)` : `${bytes(over)} over ${label} (${limit}%)`;
+  out.push(h("ul", { class: "items" },
+    h("li", {}, runway("warning", r.bytes_until_warn, r.bytes_over_warn, warn)),
+    h("li", {}, runway("critical", r.bytes_until_critical, r.bytes_over_critical, crit))));
+  if (r.inodes_total > 0) {
+    out.push(gauge("Inodes", `${num(r.inodes_total - r.inodes_available)} of ${num(r.inodes_total)} used`, pct(r.inodes_used_percent),
+      r.inodes_used_percent || 0, `Inodes: ${pct(r.inodes_used_percent)} used of ${num(r.inodes_total)}`));
+    out.push(note("The server configures no inode threshold, so the inode bar has no status color."));
+  } else {
+    out.push(note("This filesystem reports no inode counts."));
+  }
+  out.push(note(`Used counts blocks only root can write as unavailable, so it can read higher than the percent in get_disk_info. Ticks mark the warning (${warn}%) and critical (${crit}%) thresholds.`));
+  out.push(table(["Field", "Value"], [
+    ["Total", bytes(r.total_bytes)], ["Used for pressure", bytes(r.pressure_used_bytes)], ["Available", bytes(r.available_bytes)],
+    ["Reserved", bytes(r.reserved_bytes)], ["Used", pct(r.used_percent)], ["Status", String(r.status)],
+    ["Until warning", bytes(r.bytes_until_warn)], ["Until critical", bytes(r.bytes_until_critical)],
+    ["Inodes total", num(r.inodes_total)], ["Inodes available", num(r.inodes_available)], ["Inodes used", pct(r.inodes_used_percent)],
+  ]));
+  return out;
+}
+
+// Counters only mean something as movement, and one tool call is one reading. With a host that
+// proxies tools/call the View takes more readings itself and keeps the series. It never opens a
+// connection: the request goes to the host over postMessage like the handshake does.
+const WATCH_MS = 5000;
+const WATCH_MAX = 24;
+let lastData = null;
+let lastArguments = {};
+let watching = null;
+const HOST = { serverTools: false };
+
+function groupsNetwork(data) {
+  return Object.entries(data.per_interface || {}).map(([name, c]) => ({
+    label: name,
+    rates: { received: c.bytes_recv, sent: c.bytes_sent },
+    counts: { errin: c.errin, errout: c.errout, dropin: c.dropin, dropout: c.dropout },
+  }));
+}
+function groupsConntrack(data) {
+  return [{ label: "conntrack", rates: {}, counts: data.totals || {} }];
+}
+
+function readResult(result) {
+  if (result && result.isError) throw new Error("the tool returned an error");
+  let data = result && result.structuredContent;
+  if (!data) data = JSON.parse(result.content.find(c => c.type === "text").text);
+  return data;
+}
+
+function stopWatching() {
+  if (watching) { clearTimeout(watching.timer); watching.running = false; }
+}
+
+function livePanel(groupsOf) {
+  const box = h("section", { class: "live" }, h("h2", {}, "Movement"));
+  if (!HOST.serverTools) {
+    box.append(note("This host does not proxy tool calls, so the view cannot take a second reading. Call the tool twice and compare the counters."));
+    return box;
+  }
+  const body = h("div", {});
+  const start = h("button", { type: "button" }, "Watch movement");
+  const stop = h("button", { type: "button", hidden: true }, "Stop");
+  const base = new Map(groupsOf(lastData).map(g => [g.label, g]));
+  const state = { running: false, timer: null, prev: null, prevAt: 0, series: new Map(), counts: new Map(), samples: 0, message: "" };
+  const paint = () => {
+    const kids = [];
+    if (state.message) kids.push(note(state.message));
+    if (!state.samples) kids.push(note(`Counters are cumulative, so one reading cannot show a fault. Watching takes a reading every ${WATCH_MS / 1000} seconds for up to ${WATCH_MAX} readings.`));
+    for (const [label, rates] of state.series) {
+      const counts = state.counts.get(label) || {};
+      const moved = Object.entries(counts).filter(([, n]) => n > 0);
+      const line = h("div", { class: "row" }, h("div", { class: "name" }, label));
+      for (const [metric, values] of Object.entries(rates)) {
+        const peak = Math.max(...values, 1);
+        const latest = values[values.length - 1];
+        const text = `${metric} ${bytes(latest)}/s`;
+        const spark = h("span", { class: "spark", role: "img", "aria-label": `${label} ${text}, ${values.length} readings, peak ${bytes(peak)}/s` },
+          values.map(v => h("i", { style: `height: ${Math.round((v / peak) * 100)}%` })));
+        line.append(h("div", { class: "sub" }, spark, text));
+      }
+      line.append(h("div", { class: "sub" + (moved.length ? " moved" : "") },
+        moved.length ? "▲ Moved since the first reading: " + moved.map(([k, n]) => `${k} +${num(n)}`).join(", ") : "No error or drop counter has moved."));
+      kids.push(line);
+    }
+    body.replaceChildren(...kids);
+    start.hidden = state.running;
+    stop.hidden = !state.running;
+  };
+  const sample = async () => {
+    try {
+      const data = readResult(await request("tools/call", { name: CONFIG.tool, arguments: lastArguments }));
+      const now = performance.now();
+      const groups = groupsOf(data);
+      for (const g of groups) {
+        const b = base.get(g.label);
+        if (!b) continue;
+        const counts = {};
+        for (const [k, n] of Object.entries(g.counts)) {
+          // A counter that went backward was reset, and the n > 0 filter in paint() skips it.
+          counts[k] = n - (b.counts[k] || 0);
+        }
+        state.counts.set(g.label, counts);
+        const prev = state.prev && state.prev.get(g.label);
+        if (prev && Object.keys(g.rates).length) {
+          const seconds = (now - state.prevAt) / 1000;
+          const series = state.series.get(g.label) || {};
+          for (const [k, n] of Object.entries(g.rates)) {
+            const rate = Math.max(0, (n - prev.rates[k]) / seconds);
+            series[k] = [...(series[k] || []), rate].slice(-WATCH_MAX);
+          }
+          state.series.set(g.label, series);
+        } else if (!state.series.has(g.label)) {
+          state.series.set(g.label, {});
+        }
+      }
+      state.prev = new Map(groups.map(g => [g.label, g]));
+      state.prevAt = now;
+      state.samples++;
+      state.message = "";
+    } catch (e) {
+      state.running = false;
+      state.message = "The host refused a second reading: " + e.message;
+    }
+    if (state.samples >= WATCH_MAX) state.running = false;
+    paint();
+    if (state.running) state.timer = setTimeout(sample, WATCH_MS);
+  };
+  start.addEventListener("click", () => {
+    stopWatching();
+    state.running = true; state.samples = 0; state.prev = null; state.series.clear(); state.counts.clear(); state.message = "";
+    watching = state;
+    paint();
+    sample();
+  });
+  stop.addEventListener("click", () => { state.running = false; clearTimeout(state.timer); paint(); });
+  paint();
+  box.append(h("div", {}, start, stop), body);
+  return box;
+}
+
+function renderNetwork(data) {
+  const per = Object.entries(data.per_interface || {});
+  const total = data.total || {};
+  const filtering = data.filtering || {};
+  const out = [hero(bytes(total.bytes_recv), "received and " + bytes(total.bytes_sent) + " sent since boot")];
+  out.push(note("These are lifetime counters. A non-zero error or drop count says nothing until it moves between two readings. Per interface, the upper bar is received and the lower is sent, both scaled to the busiest direction."));
+  const lifetime = (c) => (c.errin || c.errout || c.dropin || c.dropout)
+    ? `errors ${num(c.errin)} in / ${num(c.errout)} out, drops ${num(c.dropin)} in / ${num(c.dropout)} out`
+    : "no errors or drops";
+  const peak = Math.max(1, ...per.map(([, c]) => Math.max(c.bytes_recv || 0, c.bytes_sent || 0)));
+  for (const [name, c] of per) {
+    out.push(h("div", { class: "row" },
+      h("div", { class: "row-head" }, h("div", { class: "name" }, name), h("div", { class: "value" }, `${bytes(c.bytes_recv)} in // ${bytes(c.bytes_sent)} out`)),
+      bar(((c.bytes_recv || 0) / peak) * 100, null), bar(((c.bytes_sent || 0) / peak) * 100, null),
+      h("div", { class: "sub" }, lifetime(c))));
+  }
+  if (!per.length) out.push(note("No interface matched the request."));
+  if (filtering.mode === "default" && filtering.omitted) out.push(note(`${filtering.omitted} virtual interfaces are left out. Call the tool with interfaces set to all for every one.`));
+  if (filtering.mode === "named" && (filtering.not_present || []).length) out.push(note("Not present: " + filtering.not_present.join(", ")));
+  out.push(livePanel(groupsNetwork));
+  out.push(table(["Interface", "Received", "Sent", "Packets in", "Packets out", "Errors in", "Errors out", "Drops in", "Drops out"],
+    per.map(([n, c]) => [n, bytes(c.bytes_recv), bytes(c.bytes_sent), num(c.packets_recv), num(c.packets_sent), num(c.errin), num(c.errout), num(c.dropin), num(c.dropout)])));
+  return out;
+}
+
+function renderConntrack(data) {
+  const totals = Object.entries(data.totals || {});
+  const out = [];
+  if (typeof data.count === "number" && data.max > 0) {
+    const percent = (data.count / data.max) * 100;
+    out.push(hero(pct(percent), `of the connection tracking table in use, ${num(data.count)} of ${num(data.max)}`));
+    out.push(gauge("Tracked connections", null, `${num(data.count)} of ${num(data.max)}`, percent, `Connection tracking: ${num(data.count)} of ${num(data.max)} entries, ${pct(percent)}`));
+    out.push(note("This is a gauge. A table that fills and drains between two readings does not show here."));
+  } else {
+    out.push(note("The connection tracking table could not be read, so there is no count to chart."));
+  }
+  for (const n of data.notes || []) out.push(h("p", { class: "flag" }, "▲ " + n));
+  out.push(note("The error totals are lifetime counters summed across CPUs. insert_failed, drop and early_drop are the ones an egress fault turns up in."));
+  // Without totals there is no counter to watch, and a panel that says nothing moved would read as a clean bill.
+  if (totals.length) out.push(livePanel(groupsConntrack));
+  out.push(table(["Counter", "Total"], [["count", num(data.count)], ["max", num(data.max)], ...totals.map(([k, n]) => [k, num(n)])]));
+  return out;
+}
+
+function containerLine(c) {
+  const s = c.state_detail || {}, l = c.last_state || {};
+  const now = s.reason ? s.reason + (typeof s.exit_code === "number" ? " exit " + s.exit_code : "") : (c.state || "unknown");
+  const before = l.reason ? "; last " + l.reason + (typeof l.exit_code === "number" ? " exit " + l.exit_code : "") : "";
+  return `${c.name}: ${now}${before}${c.restart_count ? ", " + c.restart_count + " restarts" : ""}`;
+}
+
+function renderPods(data) {
+  const pods = Array.isArray(data.pods) ? data.pods : [];
+  const ok = (p) => p.phase === "Succeeded" || (p.phase === "Running" && (p.containers || []).every(c => c.ready));
+  const bad = pods.filter(p => !ok(p));
+  const running = pods.filter(p => p.phase === "Running").length;
+  const out = [hero(`${running} of ${pods.length}`, "pods shown are Running" + (bad.length ? `, ${bad.length} need attention` : ", none need attention"))];
+  if (bad.length) {
+    out.push(h("ul", { class: "items" }, bad.slice(0, 20).map(p => h("li", {},
+      h("div", { class: "bad" }, `✕ ${p.namespace}/${p.pod}: ${p.phase}${p.reason ? " (" + p.reason + ")" : ""}`),
+      (p.containers || []).concat(p.init_containers || []).filter(c => !c.ready).map(c => h("div", { class: "sub" }, containerLine(c)))))));
+    if (bad.length > 20) out.push(note(`${bad.length - 20} more are in the table.`));
+  }
+  const restarted = pods.filter(p => ok(p) && p.restart_count > 0);
+  if (restarted.length) out.push(note("Restarted but healthy now: " + restarted.map(p => `${p.pod} (${p.restart_count})`).join(", ")));
+  if (typeof data.pod_count === "number" && data.pod_count > pods.length) out.push(note(`Showing ${pods.length} of ${data.pod_count} pods. Unhealthy pods sort first, so the cut never hides one.`));
+  out.push(errorsNote(data.errors));
+  out.push(table(["Namespace", "Pod", "Phase", "Ready", "Restarts", "Age"],
+    pods.map(p => [p.namespace, p.pod, p.phase + (p.reason ? " (" + p.reason + ")" : ""),
+      `${(p.containers || []).filter(c => c.ready).length}/${(p.containers || []).length}`, num(p.restart_count), p.age || "n/a"])));
+  return out;
+}
+
+function renderWorkloads(data) {
+  const items = Array.isArray(data.workloads) ? data.workloads : [];
+  const behind = items.filter(w => w.rollout_complete === false);
+  const out = [hero(`${items.length - behind.length} of ${items.length}`, "workloads shown are fully rolled out" + (behind.length ? `, ${behind.length} behind` : ""))];
+  for (const w of items) {
+    const desired = w.desired_replicas || 0, ready = w.ready_replicas || 0;
+    const cls = w.rollout_complete === false ? "warn" : null;
+    const detail = `${w.kind} ${w.namespace}/${w.name}: ${ready} ready, ${w.updated_replicas || 0} updated, ${w.available_replicas || 0} available, of ${desired} desired`;
+    const row = gauge(w.name, `${w.kind} in ${w.namespace}`, desired ? `${ready}/${desired} ready` : "scaled to 0",
+      desired ? (ready / desired) * 100 : 0, detail + (cls ? ", rollout incomplete" : ""), cls);
+    if (cls) row.append(h("div", { class: "flag" }, `▲ Rollout incomplete: ${w.updated_replicas || 0} of ${desired} updated, generation ${w.observed_generation ?? "n/a"} of ${w.generation ?? "n/a"} observed`));
+    out.push(row);
+  }
+  if (!items.length) out.push(note("No workload matched."));
+  if (typeof data.workload_count === "number" && data.workload_count > items.length) out.push(note(`Showing ${items.length} of ${data.workload_count} workloads, incomplete rollouts first.`));
+  out.push(note("Replica counts describe the spec and the rollout, and the table lists the spec image. A running pod can still report another image until the rollout lands."));
+  out.push(errorsNote(data.errors));
+  out.push(table(["Kind", "Namespace", "Name", "Desired", "Ready", "Updated", "Available", "Rollout", "Spec image"],
+    items.map(w => [w.kind, w.namespace, w.name, num(w.desired_replicas), num(w.ready_replicas), num(w.updated_replicas), num(w.available_replicas),
+      w.rollout_complete === true ? "complete" : w.rollout_complete === false ? "incomplete" : "n/a", (w.spec_images || []).map(i => i.image).join(", ")])));
+  return out;
+}
+
+function conditionOk(c) {
+  // Ready is healthy when True. Every other node condition (pressure, unavailable) is healthy when False.
+  return c.type === "Ready" ? c.status === "True" : c.status === "False";
+}
+
+function renderNodeHealth(data) {
+  const node = data.node;
+  if (!node) return [note("No node was returned."), errorsNote(data.errors), table(["Field", "Value"], [["Node", "none"]])];
+  const conds = node.conditions || [];
+  const events = Array.isArray(data.events) ? data.events : [];
+  const ready = conds.find(c => c.type === "Ready");
+  const bad = conds.filter(c => !conditionOk(c));
+  const warnings = events.filter(e => e.type === "Warning");
+  const out = [hero(ready ? (ready.status === "True" ? "Ready" : "Not Ready") : "Unknown", `${node.name}, ${bad.length ? bad.length + (bad.length > 1 ? " conditions need" : " condition needs") + " attention" : "no condition needs attention"}`)];
+  out.push(h("ul", { class: "items" }, conds.map(c => h("li", { class: conditionOk(c) ? "" : "bad" },
+    `${conditionOk(c) ? "✓" : "✕"} ${c.type}: ${c.status}`,
+    h("div", { class: "sub" }, [c.reason, c.last_transition_age ? "since " + c.last_transition_age + " ago" : null].filter(Boolean).join(", "))))));
+  if (node.unschedulable) out.push(h("div", { class: "flag" }, "▲ The node is cordoned (unschedulable)."));
+  const taints = node.taints || [];
+  out.push(note(taints.length ? "Taints: " + taints.map(t => `${t.key}${t.value ? "=" + t.value : ""}:${t.effect}`).join(", ") : "No taints."));
+  out.push(note(`${warnings.length} warning event${warnings.length === 1 ? "" : "s"} among ${events.length} returned` + (data.event_count > events.length ? ` of ${data.event_count}` : "") + `, within ${data.max_age_hours}h.`));
+  if (warnings.length) {
+    out.push(h("ul", { class: "items" }, warnings.slice(0, 10).map(e => h("li", {},
+      h("div", { class: "bad" }, `▲ ${e.reason}: ${(e.object || {}).kind}/${(e.object || {}).name}${e.count > 1 ? " x" + e.count : ""}, ${e.age || "n/a"} ago`),
+      h("div", { class: "sub" }, e.message || "")))));
+  }
+  out.push(errorsNote(data.errors));
+  const cap = node.capacity || {}, alloc = node.allocatable || {};
+  out.push(h("details", {},
+    h("summary", {}, "Table view"),
+    h("table", {}, h("caption", {}, "Conditions"),
+      h("thead", {}, h("tr", {}, ["Type", "Status", "Reason", "Since"].map(t => h("th", {}, t)))),
+      h("tbody", {}, conds.map(c => h("tr", {}, [c.type, c.status, c.reason || "", c.last_transition_age || ""].map(v => h("td", {}, v)))))),
+    h("table", {}, h("caption", {}, "Capacity and allocatable"),
+      h("thead", {}, h("tr", {}, ["Resource", "Capacity", "Allocatable"].map(t => h("th", {}, t)))),
+      h("tbody", {}, Object.keys(cap).map(k => h("tr", {}, [k, cap[k], alloc[k] ?? ""].map(v => h("td", {}, String(v))))))),
+    h("table", {}, h("caption", {}, "Events"),
+      h("thead", {}, h("tr", {}, ["Type", "Reason", "Object", "Age", "Count", "Message"].map(t => h("th", {}, t)))),
+      h("tbody", {}, events.map(e => h("tr", {}, [e.type, e.reason, `${(e.object || {}).kind}/${(e.object || {}).name}`, e.age || "", e.count ?? "", e.message || ""].map(v => h("td", {}, String(v)))))))));
+  return out;
+}
+
+const VIEWS = {
+  disk: ["Disk usage", renderDisk],
+  memory: ["Memory usage", renderMemory],
+  system: ["System snapshot", renderSystem],
+  cpu: ["CPU", renderCpu],
+  pressure: ["Filesystem pressure", renderPressure],
+  network: ["Network counters", renderNetwork],
+  conntrack: ["Connection tracking", renderConntrack],
+  "k3s-pods": ["k3s pods", renderPods],
+  "k3s-workloads": ["k3s workloads", renderWorkloads],
+  "k3s-node-health": ["k3s node health", renderNodeHealth],
+};
+
 function show(data) {
   const view = document.getElementById("view");
-  const nodes = CONFIG.kind === "disk" ? renderDisk(data) : renderMemory(data);
-  document.getElementById("title").textContent = CONFIG.kind === "disk" ? "Disk usage" : "Memory usage";
+  const [title, render] = VIEWS[CONFIG.kind];
+  stopWatching();
+  lastData = data;
+  const nodes = render(data);
+  document.getElementById("title").textContent = title;
   document.getElementById("status").hidden = true;
-  view.replaceChildren(...nodes);
+  view.replaceChildren(...nodes.filter(Boolean));
   view.hidden = false;
 }
 
@@ -250,10 +646,14 @@ window.addEventListener("message", (event) => {
     pending.delete(m.id);
     return m.error ? p.reject(new Error(m.error.message)) : p.resolve(m.result);
   }
-  if (m.method === "ui/notifications/tool-result") onToolResult(m.params);
+  if (m.method === "ui/notifications/tool-input") lastArguments = (m.params && m.params.arguments) || {};
+  else if (m.method === "ui/notifications/tool-result") onToolResult(m.params);
   else if (m.method === "ui/notifications/tool-cancelled") fail("The tool call was cancelled.");
   else if (m.method === "ui/notifications/host-context-changed") applyTheme(m.params);
-  else if (m.id !== undefined && (m.method === "ui/resource-teardown" || m.method === "ping")) send({ id: m.id, result: {} });
+  else if (m.id !== undefined && (m.method === "ui/resource-teardown" || m.method === "ping")) {
+    if (m.method === "ui/resource-teardown") stopWatching();
+    send({ id: m.id, result: {} });
+  }
 });
 
 if (window.parent === window) {
@@ -265,6 +665,7 @@ if (window.parent === window) {
     protocolVersion: PROTOCOL_VERSION,
   }).then((init) => {
     applyTheme(init && init.hostContext);
+    HOST.serverTools = !!(init && init.hostCapabilities && init.hostCapabilities.serverTools);
     send({ method: "ui/notifications/initialized" });
     let last = "";
     const report = () => requestAnimationFrame(() => {
