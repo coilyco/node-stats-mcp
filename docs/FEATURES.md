@@ -25,6 +25,10 @@ cumulative counters and which are instantaneous gauges, because only a
 counter's movement is interpretable and a gauge sampled coarsely reads clean
 through the event it was meant to catch.
 
+## MCP Apps views
+
+`get_disk_info` and `get_memory_info` declare `ui://` chart views that a host speaking MCP Apps renders, with the server's own disk thresholds baked in. Every other host keeps the unchanged text result. See [MCP Apps views](mcp-apps-views.md).
+
 ## OTLP export
 
 A same-image `node-stats-exporter` sidecar runs independently of the MCP

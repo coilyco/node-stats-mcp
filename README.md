@@ -95,6 +95,7 @@ large-upload publisher paths.
 - [AGENTS.md](AGENTS.md) - agent operating context for this repo.
 - [docs/FEATURES.md](docs/FEATURES.md) - inventory of what ships today.
 - [docs/tools-host.md](docs/tools-host.md) and [docs/tools-k3s.md](docs/tools-k3s.md) - every tool, argument, and bound.
+- [docs/mcp-apps-views.md](docs/mcp-apps-views.md) - the `ui://` chart views on the disk and memory tools.
 - [docs/security.md](docs/security.md) - what the host namespaces buy and what they cost.
 - [docs/configuration.md](docs/configuration.md) - environment, roots, and scan limits.
 - [docs/not-ready-alerting.md](docs/not-ready-alerting.md) - Sentry events for resources that stay not Ready.

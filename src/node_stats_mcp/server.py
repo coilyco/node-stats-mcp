@@ -40,7 +40,7 @@ from urllib.request import Request, urlopen
 import psutil
 from mcp.server.fastmcp import FastMCP
 
-from node_stats_mcp import storage
+from node_stats_mcp import storage, views
 from node_stats_mcp.crash import init_crash_reporting
 
 # Host root inside the pod. The deployment mounts the node's / read-only at
@@ -3705,7 +3705,31 @@ for _tool in (
     stat_path,
     read_text_head,
 ):
-    mcp.tool()(_tool)
+    mcp.tool(meta=views.tool_meta(_tool.__name__))(_tool)
+
+
+def disk_view() -> str:
+    """Disk usage chart for get_disk_info (MCP Apps view)."""
+    return views.render(
+        views.DISK_URI, warn_percent=_DISK_WARN_PERCENT, critical_percent=_DISK_CRITICAL_PERCENT
+    )
+
+
+def memory_view() -> str:
+    """Memory and swap chart for get_memory_info (MCP Apps view)."""
+    return views.render(
+        views.MEMORY_URI, warn_percent=_DISK_WARN_PERCENT, critical_percent=_DISK_CRITICAL_PERCENT
+    )
+
+
+# prefersBorder false: the host's own panel already frames the view.
+for _uri, _view in ((views.DISK_URI, disk_view), (views.MEMORY_URI, memory_view)):
+    mcp.resource(
+        _uri,
+        name=_view.__name__,
+        mime_type=views.RESOURCE_MIME_TYPE,
+        meta={"ui": {"prefersBorder": False}},
+    )(_view)
 
 
 def main() -> None:

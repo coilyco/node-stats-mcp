@@ -3,8 +3,8 @@
 Every tool is read-only. The k3s tools are in [k3s tools](tools-k3s.md).
 
 - **get_cpu_info** - utilization, logical/physical core counts, per-core percentages, load average.
-- **get_memory_info** - virtual and swap memory (bytes + percent).
-- **get_disk_info** - per-partition usage, filesystem type, and mount options with a `quota_enforced` flag, resolved under `ROOTFS`. Options are where a per-directory ceiling is visible: without them, directories sharing one filesystem look identical to filesystems with separate capacities.
+- **get_memory_info** - virtual and swap memory (bytes + percent). Declares a chart view, see [MCP Apps views](mcp-apps-views.md).
+- **get_disk_info** - per-partition usage, filesystem type, and mount options with a `quota_enforced` flag, resolved under `ROOTFS`. Options are where a per-directory ceiling is visible: without them, directories sharing one filesystem look identical to filesystems with separate capacities. Declares a chart view, see [MCP Apps views](mcp-apps-views.md).
 - **get_filesystem_pressure** - root filesystem capacity, available bytes, inode pressure, and byte runway to warning/critical thresholds.
 - **get_node_pressure_stalls** - fixed Linux PSI, selected VM pressure, and bounded per-device block I/O counters.
 - **get_pressure_path_usage** - worker-thread one-level attribution beneath configured node-pressure roots such as logs, journald, kubelet, k3s, and containerd storage. Every discovered child receives a fair entry and time slice, preventing a large root or child from starving siblings. Per-child results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, and timeout/truncation metadata.
