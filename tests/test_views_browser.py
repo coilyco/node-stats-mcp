@@ -39,6 +39,7 @@ HOST_PAGE = """<!doctype html>
 const frame = document.getElementById("view");
 window.log = [];
 window.hostContext = {};
+window.hostCapabilities = {};
 window.toolResults = {};
 window.addEventListener("message", (event) => {
   const m = event.data;
@@ -47,7 +48,7 @@ window.addEventListener("message", (event) => {
   if (m.method === "ui/initialize") {
     frame.contentWindow.postMessage({ jsonrpc: "2.0", id: m.id, result: {
       protocolVersion: "__PROTOCOL_VERSION__", hostInfo: { name: "test-host", version: "0" },
-      hostCapabilities: {}, hostContext: window.hostContext } }, "*");
+      hostCapabilities: window.hostCapabilities, hostContext: window.hostContext } }, "*");
   } else if (m.method === "ui/notifications/size-changed") {
     frame.style.height = m.params.height + "px";
   } else if (m.method === "tools/call") {
@@ -121,9 +122,238 @@ def memory_payload(swap_gib: int = 8) -> dict[str, Any]:
     }
 
 
+def system_payload() -> dict[str, Any]:
+    """Shaped like kai-server: 28 logical cores, no logged-in users."""
+    return {
+        "cpu_percent": 13.3,
+        "memory": {
+            "total": 31 * GIB,
+            "available": 13 * GIB,
+            "percent": 56.8,
+            "used": 17 * GIB,
+            "free": 2 * GIB,
+        },
+        "load_avg_1_5_15": [10.13, 12.58, 10.15],
+        "boot_time_epoch": 1790303480,
+        "uptime_seconds": 1127113.7,
+        "logged_in_users": [],
+    }
+
+
+def cpu_payload() -> dict[str, Any]:
+    cores = [0, 0, 6.7, 0, 3.4, 100, 9.7, 0, 3.3, 6.9, 10.0, 0]
+    return {
+        "percent": 7.9,
+        "per_core_percent": cores,
+        "logical_cores": len(cores),
+        "physical_cores": 6,
+        "load_avg_1_5_15": [10.13, 12.58, 10.15],
+    }
+
+
+def pressure_payload(used_percent: float = 77.84) -> dict[str, Any]:
+    """Thresholds 80 and 85, as the server's defaults. The View draws these, not its config."""
+    total = 500 * GIB
+    used = int(total * used_percent / 100)
+    warn, critical = int(total * 0.80), int(total * 0.85)
+    status = "critical" if used_percent >= 85 else "warning" if used_percent >= 80 else "ok"
+    return {
+        "root": {
+            "path": "/",
+            "total_bytes": total,
+            "free_bytes": total - used,
+            "available_bytes": total - used,
+            "reserved_bytes": 0,
+            "pressure_used_bytes": used,
+            "used_percent": used_percent,
+            "status": status,
+            "warn_percent": 80,
+            "critical_percent": 85,
+            "bytes_until_warn": warn - used,
+            "bytes_until_critical": critical - used,
+            "bytes_over_warn": max(0, used - warn),
+            "bytes_over_critical": max(0, used - critical),
+            "inodes_total": 33529856,
+            "inodes_free": 30429098,
+            "inodes_available": 30429098,
+            "inodes_used_percent": 9.25,
+        }
+    }
+
+
+def _nic(sent: int, recv: int, **counters: int) -> dict[str, Any]:
+    zeroes = {"errin": 0, "errout": 0, "dropin": 0, "dropout": 0}
+    return {
+        "bytes_sent": sent,
+        "bytes_recv": recv,
+        "packets_sent": sent // 1000,
+        "packets_recv": recv // 1000,
+        **zeroes,
+        **counters,
+    }
+
+
+def network_payload(dropout: int = 1359) -> dict[str, Any]:
+    """Lifetime counters as on kai-server: drops that happened days ago, not now."""
+    return {
+        "total": _nic(4930 * GIB, 6148 * GIB, dropin=917, dropout=3242),
+        "per_interface": {
+            "enp1s0": _nic(968 * GIB, 360 * GIB, dropin=917),
+            "flannel.1": _nic(0, 0, dropout=1883),
+            "tailscale0": _nic(835 * GIB, 38 * GIB, dropout=dropout),
+        },
+        "filtering": {"mode": "default", "omitted": 142, "omitted_prefixes": ["veth"]},
+        "counter_semantics": "cumulative since boot",
+    }
+
+
+UNREAD_NOTE = (
+    "/proc/net/stat/nf_conntrack is not present, so insert_failed, drop and early_drop "
+    "are UNREAD rather than zero. count and max above are real."
+)
+
+
+def conntrack_payload(totals: dict[str, int] | None = None) -> dict[str, Any]:
+    """Default is kai-server: the stat file is absent, so the totals are unread."""
+    return {
+        "count": 3873,
+        "max": 917504,
+        "utilization": 0.0042,
+        "cpus": 28 if totals else 0,
+        "totals": totals or {},
+        "notes": [] if totals else [UNREAD_NOTE],
+    }
+
+
+def _container(name: str, ready: bool, state: str, **detail: Any) -> dict[str, Any]:
+    return {
+        "name": name,
+        "image": "registry.test/" + name,
+        "ready": ready,
+        "restart_count": detail.pop("restarts", 0),
+        "state": state,
+        "state_detail": {"type": state, **detail},
+        "last_state": detail.pop("last", None),
+    }
+
+
+def pods_payload() -> dict[str, Any]:
+    def pod(ns: str, name: str, phase: str, containers: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "namespace": ns,
+            "pod": name,
+            "phase": phase,
+            "node": "kai-server",
+            "restart_count": sum(c["restart_count"] for c in containers),
+            "age": "2d1h",
+            "reason": None,
+            "message": None,
+            "containers": containers,
+            "init_containers": [],
+        }
+
+    crash = _container("api", False, "waiting", reason="CrashLoopBackOff", restarts=9)
+    crash["last_state"] = {"type": "terminated", "reason": "OOMKilled", "exit_code": 137}
+    flaky = _container("provisioner", True, "running", restarts=40)
+    done = _container("helm", False, "terminated", reason="Completed", exit_code=0)
+    return {
+        "namespace": None,
+        # Three pods returned of six: the hero counts what is drawn, never pod_count.
+        "pods": [
+            pod("apps", "api-7d9", "Running", [crash]),
+            pod("kube-system", "helm-install-traefik", "Succeeded", [done]),
+            pod("kube-system", "local-path-provisioner", "Running", [flaky]),
+        ],
+        "pod_count": 6,
+        "returned_pod_count": 3,
+        "errors": [],
+    }
+
+
+def workloads_payload() -> dict[str, Any]:
+    def workload(kind: str, ns: str, name: str, desired: int, ready: int, updated: int) -> Any:
+        return {
+            "kind": kind,
+            "namespace": ns,
+            "name": name,
+            "generation": 5,
+            "observed_generation": 5,
+            "spec_images": [{"container": name, "image": f"registry.test/{name}:abc"}],
+            "desired_replicas": desired,
+            "ready_replicas": ready,
+            "updated_replicas": updated,
+            "available_replicas": ready,
+            "rollout_complete": desired == ready == updated,
+            "conditions": [],
+        }
+
+    return {
+        "namespace": None,
+        "workloads": [
+            workload("Deployment", "apps", "api", 3, 2, 1),
+            workload("Deployment", "authelia", "authelia", 1, 1, 1),
+            workload("StatefulSet", "db", "idle", 0, 0, 0),
+        ],
+        "workload_count": 150,
+        "returned_workload_count": 3,
+        "errors": [],
+    }
+
+
+def node_health_payload(disk_pressure: str = "False") -> dict[str, Any]:
+    def cond(kind: str, status: str, reason: str, since: str) -> dict[str, Any]:
+        return {"type": kind, "status": status, "reason": reason, "last_transition_age": since}
+
+    return {
+        "node": {
+            "name": "kai-server",
+            "age": "543d1h",
+            "unschedulable": False,
+            "taints": [],
+            "capacity": {"cpu": "28", "memory": "32543264Ki", "pods": "180"},
+            "allocatable": {"cpu": "26", "memory": "30446112Ki", "pods": "180"},
+            "conditions": [
+                cond("MemoryPressure", "False", "KubeletHasSufficientMemory", "73d"),
+                cond("DiskPressure", disk_pressure, "KubeletHasDiskPressure", "3m"),
+                cond("Ready", "True", "KubeletReady", "73d"),
+            ],
+        },
+        "events": [
+            {
+                "type": "Warning",
+                "reason": "EvictionThresholdMet",
+                "message": "Attempting to reclaim ephemeral-storage",
+                "count": 2,
+                "object": {"kind": "Node", "name": "kai-server"},
+                "age": "2m",
+            },
+            {
+                "type": "Normal",
+                "reason": "Started",
+                "message": "Started container heartbeat",
+                "count": 1,
+                "object": {"kind": "Pod", "name": "gatus-heartbeat"},
+                "age": "1m",
+            },
+        ],
+        "event_count": 35,
+        "returned_event_count": 2,
+        "max_age_hours": 24,
+        "errors": [],
+    }
+
+
 VIEW_FIXTURES: dict[str, Callable[[], dict[str, Any]]] = {
     "disk": disk_payload,
     "memory": memory_payload,
+    "system": system_payload,
+    "cpu": cpu_payload,
+    "pressure": pressure_payload,
+    "network": network_payload,
+    "conntrack": conntrack_payload,
+    "k3s-pods": pods_payload,
+    "k3s-workloads": workloads_payload,
+    "k3s-node-health": node_health_payload,
 }
 
 
@@ -201,8 +431,14 @@ class Host:
         )
         self.page.goto(HOST_URL)
 
-    def load(self, html: str, host_context: dict[str, Any] | None = None) -> None:
+    def load(
+        self,
+        html: str,
+        host_context: dict[str, Any] | None = None,
+        capabilities: dict[str, Any] | None = None,
+    ) -> None:
         self.page.evaluate("ctx => { window.hostContext = ctx }", host_context or {})
+        self.page.evaluate("caps => { window.hostCapabilities = caps }", capabilities or {})
         self.page.evaluate("html => window.loadView(html)", html)
 
     def wait_until(self, condition: Callable[[], bool], what: str, timeout_ms: int = 5000) -> None:
@@ -242,14 +478,18 @@ def open_view(browser: Browser, declared_views: dict[str, str]) -> Iterator[Call
     hosts: list[Host] = []
 
     def open_(
-        kind: str, *, scheme: str = "light", host_context: dict[str, Any] | None = None
+        kind: str,
+        *,
+        scheme: str = "light",
+        host_context: dict[str, Any] | None = None,
+        capabilities: dict[str, Any] | None = None,
     ) -> Host:
         context = browser.new_context(color_scheme=scheme, viewport={"width": 700, "height": 900})  # type: ignore[arg-type]
         contexts.append(context)
         host = Host(context)
         hosts.append(host)
         uri = next(u for u in declared_views if _kind(u) == kind)
-        host.load(declared_views[uri], host_context)
+        host.load(declared_views[uri], host_context, capabilities)
         return host
 
     yield open_
@@ -536,3 +776,164 @@ def test_host_answers_tools_call_from_the_view_in_queue_order(
     assert frame.evaluate(ask, "get_network_info")["result"] == second
     assert "no result queued" in frame.evaluate(ask, "get_network_info")["error"]["message"]
     assert [c["params"]["name"] for c in host.sent("tools/call")] == ["get_network_info"] * 3
+
+
+def test_pressure_draws_the_thresholds_the_result_carries_not_the_page_config(
+    open_view: Callable[..., Host],
+) -> None:
+    # The page config says 70/90 (see declared_views). The result says 80/85 and wins.
+    host = open_view("pressure")
+    host.wait_initialized()
+    host.result(pressure_payload(used_percent=82.0))
+
+    ticks = host.ui(".bar .tick")
+    expect(ticks).to_have_count(2)
+    expect(ticks.nth(0)).to_have_attribute("style", "left: 80%")
+    expect(ticks.nth(1)).to_have_attribute("style", "left: 85%")
+    expect(host.ui(".flag")).to_have_text("▲ Warning: at or above 80%")
+    expect(host.ui(".items li").nth(0)).to_contain_text("over warning (80%)")
+    expect(host.ui(".items li").nth(1)).to_contain_text("until critical (85%)")
+
+
+def test_pressure_below_the_warning_threshold_draws_no_flag(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("pressure")
+    host.wait_initialized()
+    host.result(pressure_payload())
+
+    expect(host.ui(".flag")).to_have_count(0)
+    expect(host.ui(".items li").nth(0)).to_contain_text("until warning (80%)")
+
+
+def test_pods_count_the_rows_drawn_and_name_why_the_broken_one_is_broken(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("k3s-pods")
+    host.wait_initialized()
+    host.result(pods_payload())
+
+    # pod_count is 6 and three rows came back. The hero must not claim "of 6".
+    expect(host.ui(".hero b")).to_have_text("2 of 3")
+    attention = host.ui(".items li")
+    expect(attention).to_have_count(1)
+    expect(attention).to_contain_text("apps/api-7d9")
+    expect(attention).to_contain_text("CrashLoopBackOff; last OOMKilled exit 137, 9 restarts")
+    expect(host.ui(".note", has_text="Showing 3 of 6 pods")).to_have_count(1)
+    expect(host.ui(".note", has_text="Restarted but healthy now")).to_contain_text("(40)")
+
+
+def test_workloads_flag_only_the_incomplete_rollout(open_view: Callable[..., Host]) -> None:
+    host = open_view("k3s-workloads")
+    host.wait_initialized()
+    host.result(workloads_payload())
+
+    expect(host.ui(".hero b")).to_have_text("2 of 3")
+    expect(host.ui(".flag")).to_have_count(1)
+    expect(host.ui(".flag")).to_contain_text("Rollout incomplete: 1 of 3 updated")
+    expect(host.ui(".row", has_text="idle")).to_contain_text("scaled to 0")
+
+
+def test_node_conditions_read_true_as_healthy_only_for_ready(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("k3s-node-health")
+    host.wait_initialized()
+    host.result(node_health_payload(disk_pressure="True"))
+
+    expect(host.ui(".hero b")).to_have_text("Ready")
+    expect(host.ui(".hero span")).to_contain_text("1 condition needs attention")
+    bad = host.ui(".items li.bad")
+    expect(bad).to_have_count(1)
+    expect(bad).to_contain_text("✕ DiskPressure: True")
+    expect(host.ui(".items li", has_text="✓ Ready: True")).to_have_count(1)
+    expect(host.ui(".items li", has_text="✓ MemoryPressure: False")).to_have_count(1)
+    expect(host.ui("details table")).to_have_count(3)
+
+
+def test_node_with_every_condition_clear_says_so(open_view: Callable[..., Host]) -> None:
+    host = open_view("k3s-node-health")
+    host.wait_initialized()
+    host.result(node_health_payload())
+
+    expect(host.ui(".hero span")).to_contain_text("no condition needs attention")
+    expect(host.ui(".items li.bad")).to_have_count(0)
+
+
+def test_conntrack_with_unread_totals_prints_the_note_and_offers_no_movement(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("conntrack", capabilities={"serverTools": {}})
+    host.wait_initialized()
+    host.result(conntrack_payload())
+
+    # A movement panel here would read "nothing moved" about counters nobody read.
+    expect(host.ui(".flag")).to_contain_text("UNREAD rather than zero")
+    expect(host.ui(".live")).to_have_count(0)
+
+
+def test_a_host_without_server_tools_is_told_to_call_the_tool_twice(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("network")
+    host.wait_initialized()
+    host.result(network_payload())
+
+    expect(host.ui(".live")).to_contain_text("does not proxy tool calls")
+    expect(host.ui(".live button")).to_have_count(0)
+
+
+def test_watching_asks_the_host_for_the_same_tool_and_names_a_counter_that_moved(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("network", capabilities={"serverTools": {}})
+    host.wait_initialized()
+    host.send("ui/notifications/tool-input", {"arguments": {"interfaces": "all"}})
+    host.tool_results("get_network_info", [_tool_result(network_payload(dropout=1366))])
+    host.result(network_payload())
+
+    expect(host.ui(".live")).to_contain_text("Counters are cumulative")
+    host.ui(".live button", has_text="Watch movement").click()
+
+    expect(host.ui(".live .moved")).to_have_text(
+        "▲ Moved since the first reading: dropout +7", timeout=5000
+    )
+    (call,) = host.sent("tools/call")
+    assert call["params"] == {"name": "get_network_info", "arguments": {"interfaces": "all"}}
+    expect(host.ui(".live .row", has_text="enp1s0")).to_contain_text(
+        "No error or drop counter has moved"
+    )
+    host.ui(".live button", has_text="Stop").click()
+    expect(host.ui(".live button", has_text="Watch movement")).to_be_visible()
+
+
+def test_a_counter_that_goes_backward_is_a_reset_not_negative_movement(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("network", capabilities={"serverTools": {}})
+    host.wait_initialized()
+    host.tool_results("get_network_info", [_tool_result(network_payload(dropout=3))])
+    host.result(network_payload())
+
+    host.ui(".live button", has_text="Watch movement").click()
+
+    expect(host.ui(".live .row", has_text="tailscale0")).to_contain_text(
+        "No error or drop counter has moved", timeout=5000
+    )
+    host.ui(".live button", has_text="Stop").click()
+
+
+def test_a_refused_second_reading_is_reported_and_stops_the_watch(
+    open_view: Callable[..., Host],
+) -> None:
+    host = open_view("network", capabilities={"serverTools": {}})
+    host.wait_initialized()
+    host.result(network_payload())
+
+    # Nothing queued for get_network_info, so the host answers with an error.
+    host.ui(".live button", has_text="Watch movement").click()
+
+    expect(host.ui(".live .note").first).to_contain_text(
+        "The host refused a second reading", timeout=5000
+    )
+    expect(host.ui(".live button", has_text="Watch movement")).to_be_visible()

@@ -19,7 +19,7 @@ A counter reads as nothing until it moves ([networking tools](tools-network.md))
 
 * **Cadence and bound.** One reading every five seconds, at most 24, one call in flight at a time. Teardown and a new result stop it.
 * **Rates.** Bytes per second between consecutive readings, as a column strip per direction, timed by when the reply arrived.
-* **Moves.** Error and drop counters are shown as the increase since the first reading the view was opened with, and a movement is named in text. A counter that goes backward counts as a reset and reads zero.
+* **Moves.** Error and drop counters are shown as the increase since the first reading the view was opened with, and a movement is named in text. A counter that goes backward is a reset and shows no movement.
 * **Host without serverTools.** The panel says it cannot take a second reading and to call the tool twice.
 
 ## Not yet viewed

@@ -405,9 +405,8 @@ function livePanel(groupsOf) {
         if (!b) continue;
         const counts = {};
         for (const [k, n] of Object.entries(g.counts)) {
-          const delta = n - (b.counts[k] || 0);
-          // A counter that went backward was reset (restart, or the interface was recreated).
-          counts[k] = delta < 0 ? 0 : delta;
+          // A counter that went backward was reset, and the n > 0 filter in paint() skips it.
+          counts[k] = n - (b.counts[k] || 0);
         }
         state.counts.set(g.label, counts);
         const prev = state.prev && state.prev.get(g.label);
