@@ -1,7 +1,8 @@
 # Tests on every pull request to main and every push to main, then publishes
-# the node-stats-mcp image to Forgejo OCI on push to main only. The publish
-# job runs on the runner that holds the registry token, so it must never see a
-# pull_request event. No deploy stage here: rollout is driven from
+# the node-stats-mcp image to Forgejo OCI from refs/heads/main only, whatever
+# the event. The publish job runs on the runner that holds the registry token,
+# so a pull_request or a branch dispatch must never reach it. No deploy stage
+# here: rollout is driven from
 # coilyco-bridge/deploy/services/node-stats-mcp per the layer invariant
 # (source -> deploy).
 name: build-publish
@@ -36,7 +37,7 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_CI_DSN }}
         run: python3 scripts/alert_sentry.py
   publish:
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: deploy
     needs: [test]
     timeout-minutes: 30
