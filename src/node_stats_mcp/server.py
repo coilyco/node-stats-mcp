@@ -3159,7 +3159,9 @@ def get_disk_info() -> dict[str, Any]:
     """
     partitions = []
     for part in psutil.disk_partitions(all=False):
-        mount = Path(ROOTFS).joinpath(part.mountpoint.lstrip("/"))
+        # The pod's mount table already lists the node's mounts as ROOTFS/<path>,
+        # so a blind join gave ROOTFS/ROOTFS/<path> (COI-2502).
+        mount = _host_path(part.mountpoint)
         try:
             usage = psutil.disk_usage(str(mount))._asdict()
         except (PermissionError, FileNotFoundError, OSError):

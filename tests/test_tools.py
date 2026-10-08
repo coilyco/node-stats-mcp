@@ -1870,6 +1870,36 @@ def test_disk_info_surfaces_mount_options_and_quota_state(
     assert parts["/data"]["quota_enforced"] is True
 
 
+def test_disk_info_reads_usage_for_mounts_already_rooted_under_rootfs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """COI-2502: the pod's mount table lists the node's mounts as /host/<path>.
+
+    Joining ROOTFS onto those gave /host/host/<path>, which does not exist, so
+    57 of 60 mounts on kai-server came back with an empty usage object.
+    """
+    (tmp_path / "srv" / "data").mkdir(parents=True)
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "hosts").write_text("")
+    server = _load(monkeypatch, str(tmp_path), "")
+    fake = [
+        SimpleNamespace(
+            device="/dev/nvme0n1p8", mountpoint=f"{tmp_path}/srv/data", fstype="ext4", opts="rw"
+        ),
+        SimpleNamespace(device="/dev/nvme0n1p7", mountpoint="/etc/hosts", fstype="ext4", opts="rw"),
+        SimpleNamespace(
+            device="/dev/gone", mountpoint=f"{tmp_path}/gone", fstype="ext4", opts="rw"
+        ),
+    ]
+    monkeypatch.setattr(server.psutil, "disk_partitions", lambda **_kwargs: fake)
+
+    parts = {p["mountpoint"]: p for p in server.get_disk_info()["partitions"]}
+
+    assert parts[f"{tmp_path}/srv/data"]["usage"]["total"] > 0
+    assert parts["/etc/hosts"]["usage"]["total"] > 0
+    assert parts[f"{tmp_path}/gone"]["usage"] == {}
+
+
 def test_disk_info_without_options_does_not_claim_a_quota(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
