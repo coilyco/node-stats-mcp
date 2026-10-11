@@ -5,7 +5,7 @@ diagnostics, with an OTLP exporter.
 
 ## Tools
 
-All read-only: 33 host and node tools in [host tools](tools-host.md) and 14
+All read-only: 19 host and node tools in [host tools](tools-host.md) and 14
 cluster tools in [k3s tools](tools-k3s.md), covering CPU, memory, disk,
 filesystem and PSI pressure, usage attribution, deleted open files, network,
 processes, and the k3s pod, workload, storage, event, namespace, network,
@@ -24,6 +24,12 @@ interfaces that carry traffic. It also states which of its readings are
 cumulative counters and which are instantaneous gauges, because only a
 counter's movement is interpretable and a gauge sampled coarsely reads clean
 through the event it was meant to catch.
+
+A [host firewall tool](tools-firewall.md) reports whether ufw is enabled, its
+default policies, the IPv4 and IPv6 rules, and what the input rules decide for
+each listening socket. It reads ufw's own files through the existing read-only
+host mount, so it needs no new host privilege, and it says plainly that it does
+not confirm the kernel chains.
 
 ## MCP Apps views
 

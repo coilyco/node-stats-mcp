@@ -24,6 +24,7 @@ import binascii
 import json
 import os
 import re
+import socket
 import ssl
 import stat
 import tempfile
@@ -41,7 +42,7 @@ from urllib.request import Request, urlopen
 import psutil
 from mcp.server.fastmcp import FastMCP
 
-from node_stats_mcp import storage, views
+from node_stats_mcp import firewall, storage, views
 from node_stats_mcp.crash import init_crash_reporting
 
 # Host root inside the pod. The deployment mounts the node's / read-only at
@@ -3292,6 +3293,57 @@ def get_network_info(interfaces: str = "default") -> dict[str, Any]:
     }
 
 
+async def get_host_firewall(limit: int = firewall.DEFAULT_LIMIT) -> dict[str, Any]:
+    """ufw state, default policies, IPv4 and IPv6 rules, and what they decide per listener.
+
+    Read from ufw's own files (ufw.conf, /etc/default/ufw, user.rules, user6.rules)
+    through the host mount, so it replaces `sudo ufw status verbose` for the
+    questions a seat asks. `status_verbose_header` carries the lines that command
+    prints above its table, for a by-eye match.
+
+    NOT a kernel read: `kernel_chains_verified` is always false. `ufw status` also
+    confirms the ufw-user-input chain is loaded, which needs CAP_NET_ADMIN. When
+    ufw.conf says ENABLED=no the answer is inactive. When it says yes, the notes say
+    what is left unconfirmed. Each listener's `verdict` is what the INPUT rules decide
+    for a source that matches no restricted rule, with the restricted rules listed.
+
+    `limit` caps rules per family and listeners. Needs the host mount for the rules
+    and hostNetwork for the listener view of the node. No tool path accepts a file name.
+    """
+    listeners, notes = await asyncio.to_thread(_listening_sockets)
+    return await asyncio.to_thread(firewall.snapshot, ROOTFS, listeners, notes, limit)
+
+
+def _listening_sockets() -> tuple[list[dict[str, Any]], list[str]]:
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, PermissionError):
+        return [], [
+            "Reading listening sockets was denied, so no per-listener verdicts are present. "
+            "The walk needs hostNetwork and privilege to read /proc/net."
+        ]
+    seen: set[tuple[str, str, str, int]] = set()
+    listeners: list[dict[str, Any]] = []
+    for conn in connections:
+        if not conn.laddr:
+            continue
+        protocol = "tcp" if conn.type == socket.SOCK_STREAM else "udp"
+        if protocol == "tcp" and conn.status != psutil.CONN_LISTEN:
+            continue
+        if protocol == "udp" and conn.raddr:
+            continue
+        family = "v6" if conn.family == socket.AF_INET6 else "v4"
+        key = (protocol, family, conn.laddr.ip, conn.laddr.port)
+        if key in seen:
+            continue
+        seen.add(key)
+        listeners.append(
+            {"protocol": protocol, "family": family, "address": key[2], "port": key[3]}
+        )
+    listeners.sort(key=lambda item: (item["port"], item["protocol"], item["family"]))
+    return listeners, []
+
+
 def get_conntrack() -> dict[str, Any]:
     """Netfilter connection tracking: count against max, and the per-CPU error totals.
 
@@ -3685,6 +3737,7 @@ for _tool in (
     get_deleted_open_files,
     get_network_info,
     get_conntrack,
+    get_host_firewall,
     get_resolver,
     get_socket_states,
     get_top_processes,
