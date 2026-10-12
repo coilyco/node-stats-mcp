@@ -1,9 +1,11 @@
-"""Read-only ufw state, taken from ufw's own config files and never from netfilter.
+"""Read-only ufw state, taken from ufw's own config files and a host-written snapshot.
 
-The module reads four fixed files under ROOTFS and opens nothing a caller names.
+The module reads five fixed files under ROOTFS and opens nothing a caller names.
 It cannot change a rule: there is no write path and no subprocess. Live netfilter
-needs CAP_NET_ADMIN, which the pod does not hold, so `kernel_chains_verified` is
-always False and the result says what that leaves open. See docs/tools-firewall.md.
+needs CAP_NET_ADMIN, which the pod does not hold, so the kernel half comes from a
+root timer's dump of `ufw status verbose` and `nft list ruleset` (COI-2704).
+`kernel_chains_verified` is True only for a fresh dump that shows ufw active with
+its chains loaded. See docs/tools-firewall.md.
 """
 
 from __future__ import annotations
@@ -17,6 +19,12 @@ from typing import Any
 UFW_CONF = "/etc/ufw/ufw.conf"
 UFW_DEFAULTS = "/etc/default/ufw"
 UFW_RULES = {"v4": "/etc/ufw/user.rules", "v6": "/etc/ufw/user6.rules"}
+# Written every 5 min by the host-firewall-snapshot timer in infrastructure.
+SNAPSHOT_PATH = "/var/lib/host-firewall-snapshot/state.txt"
+# Three missed runs. Older than this and the dump says nothing about now.
+STALE_AFTER_SECONDS = 900
+# The dump carries the whole nft ruleset, which kube-proxy makes large.
+MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 
 # The rules files are a few KB. The cap only stops a wrong file from streaming.
 MAX_FILE_BYTES = 262144
@@ -30,15 +38,20 @@ _DIRECTION_RE = re.compile(r"^(in|out)([_!]|$)")
 _POLICY_WORDS = {"accept": "allow", "reject": "reject"}
 _KEY_VALUE_RE = re.compile(r'^\s*(\w+)\s*=\s*"?([^"#\s]*)"?')
 _HEX_RE = re.compile(r"^(?:[0-9a-f]{2})+$")
+_SNAPSHOT_HEADER_RE = re.compile(r"^# host-firewall-snapshot (\S+) host=(\S+)\s*$")
+_UFW_STATUS_RE = re.compile(r"^Status:\s*(active|inactive)\s*$", re.MULTILINE)
+_COMMAND_EXIT_RE = re.compile(r"^(ufw|nft) exited (\d+)\s*$", re.MULTILINE)
+_UFW_CHAIN_RE = re.compile(r"^\s*chain (ufw6?-user-input)\b", re.MULTILINE)
 
 
-def _read_file(rootfs: str, path: str) -> dict[str, Any]:
+def _read_file(rootfs: str, path: str, max_bytes: int | None = None) -> dict[str, Any]:
     """Read one fixed file, bounded, reporting why it is absent rather than empty."""
+    cap = max_bytes or MAX_FILE_BYTES
     target = Path(rootfs).joinpath(path.lstrip("/"))
     source: dict[str, Any] = {"path": path, "readable": False}
     try:
         with target.open("rb") as handle:
-            data = handle.read(MAX_FILE_BYTES + 1)
+            data = handle.read(cap + 1)
         mtime = target.stat().st_mtime
     except FileNotFoundError:
         source["reason"] = "absent"
@@ -49,15 +62,132 @@ def _read_file(rootfs: str, path: str) -> dict[str, Any]:
     else:
         source.update(
             readable=True,
-            truncated=len(data) > MAX_FILE_BYTES,
+            truncated=len(data) > cap,
             modified=datetime.fromtimestamp(mtime, UTC).isoformat(timespec="seconds"),
-            text=data[:MAX_FILE_BYTES].decode("utf-8", errors="replace"),
+            text=data[:cap].decode("utf-8", errors="replace"),
         )
     return source
 
 
 def _public_source(source: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in source.items() if key != "text"}
+
+
+def _snapshot_sections(text: str) -> dict[str, str]:
+    """The dump's `## <command>` sections, each as its text."""
+    sections: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current = sections.setdefault(line[3:].strip(), [])
+        elif current is not None:
+            current.append(line)
+    return {name: "\n".join(lines) for name, lines in sections.items()}
+
+
+def _failed_command(section: str, command: str) -> int | None:
+    """The non-zero exit the dump recorded for a command, if it recorded one."""
+    for name, code in _COMMAND_EXIT_RE.findall(section):
+        if name == command and int(code) != 0:
+            return int(code)
+    return None
+
+
+def read_kernel_snapshot(rootfs: str, now: datetime | None = None) -> dict[str, Any]:
+    """What the host's root timer last saw of ufw in the kernel, and whether to trust it.
+
+    `state` is one of: verified, inactive, stale, not_deployed, unreadable, malformed,
+    ufw_error, nft_error, chains_missing, unconfirmed. Only `verified` and `inactive`
+    answer the kernel question. A missing file is not_deployed, never inactive.
+    """
+    now = now or datetime.now(UTC)
+    source = _read_file(rootfs, SNAPSHOT_PATH, MAX_SNAPSHOT_BYTES)
+    reading: dict[str, Any] = {
+        "state": "unreadable",
+        "source": _public_source(source),
+        "taken": None,
+        "host": None,
+        "age_seconds": None,
+        "stale": None,
+        "ufw_status": None,
+        "ufw_chains": [],
+        "problem": None,
+    }
+    if not source["readable"]:
+        if source["reason"] == "absent":
+            reading["state"] = "not_deployed"
+            reading["problem"] = (
+                f"{SNAPSHOT_PATH} is absent: the snapshot timer is not deployed or has not run."
+            )
+        else:
+            reading["problem"] = f"{SNAPSHOT_PATH} could not be read ({source['reason']})."
+        return reading
+
+    text = source["text"]
+    header = _SNAPSHOT_HEADER_RE.match(text.partition("\n")[0])
+    try:
+        taken = datetime.fromisoformat(header.group(1).replace("Z", "+00:00")) if header else None
+    except ValueError:
+        taken = None
+    if header is None or taken is None:
+        reading["state"] = "malformed"
+        reading["problem"] = "line 1 is not `# host-firewall-snapshot <UTC ISO8601> host=<name>`."
+        return reading
+    if taken.tzinfo is None:
+        taken = taken.replace(tzinfo=UTC)
+    modified = datetime.fromisoformat(source["modified"])
+    # The larger age decides: a touched file or an old header alone cannot pass.
+    age = max(0, int(max((now - modified).total_seconds(), (now - taken).total_seconds())))
+    reading.update(
+        taken=taken.isoformat(timespec="seconds"),
+        host=header.group(2),
+        age_seconds=age,
+        stale=age > STALE_AFTER_SECONDS,
+    )
+
+    sections = _snapshot_sections(text)
+    ufw = sections.get("ufw status verbose")
+    nft = sections.get("nft list ruleset")
+    status = _UFW_STATUS_RE.search(ufw) if ufw is not None else None
+    reading["ufw_status"] = status.group(1) if status else None
+    chains = sorted(set(_UFW_CHAIN_RE.findall(nft))) if nft is not None else []
+    reading["ufw_chains"] = chains
+
+    if reading["stale"]:
+        reading["state"] = "stale"
+        reading["problem"] = (
+            f"the snapshot is {age}s old, past {STALE_AFTER_SECONDS}s: the timer may have stopped."
+        )
+    elif ufw is None:
+        reading["state"] = "malformed"
+        reading["problem"] = "the `## ufw status verbose` section is missing."
+    elif (code := _failed_command(ufw, "ufw")) is not None:
+        reading["state"] = "ufw_error"
+        reading["problem"] = f"ufw exited {code} on the host, so the kernel state is unknown."
+    elif status is None:
+        reading["state"] = "ufw_error"
+        reading["problem"] = "the ufw section has no `Status:` line, so the kernel state is unknown"
+    elif status.group(1) == "inactive":
+        reading["state"] = "inactive"
+    elif nft is None or (code := _failed_command(nft, "nft")) is not None:
+        reading["state"] = "nft_error"
+        reading["problem"] = (
+            "ufw reports active but the nft ruleset is missing or failed"
+            + (f" (nft exited {code})" if nft is not None else "")
+            + ", so its chains are unconfirmed."
+        )
+    elif "ufw-user-input" in chains:
+        reading["state"] = "verified"
+    elif source["truncated"]:
+        reading["state"] = "unconfirmed"
+        reading["problem"] = (
+            f"the dump is cut at {MAX_SNAPSHOT_BYTES} bytes before a ufw chain appears, "
+            "so a missing chain is not proven."
+        )
+    else:
+        reading["state"] = "chains_missing"
+        reading["problem"] = "ufw reports active but ufw-user-input is not in the nft ruleset."
+    return reading
 
 
 def parse_settings(text: str) -> dict[str, str]:
@@ -289,14 +419,34 @@ def _header(
     ]
 
 
+def _kernel_notes(kernel: dict[str, Any], enabled: bool | None, ipv6_managed: bool) -> list[str]:
+    """Plain-language lines for the kernel reading, including where it disagrees with the config."""
+    state, age = kernel["state"], kernel["age_seconds"]
+    if state == "verified":
+        notes = [f"kernel chains verified from the host snapshot of {kernel['taken']}, {age}s old."]
+        if ipv6_managed and "ufw6-user-input" not in kernel["ufw_chains"]:
+            notes.append("IPV6=yes but ufw6-user-input is not in the snapshot's nft ruleset.")
+    elif state == "inactive":
+        notes = [f"the host snapshot ({age}s old) shows ufw inactive in the kernel."]
+    else:
+        notes = [f"kernel state not read: {kernel['problem']}"]
+    if state == "inactive" and enabled:
+        notes.append("ufw.conf says ENABLED=yes but the kernel shows ufw inactive: not filtering.")
+    if state == "verified" and enabled is False:
+        notes.append("ufw.conf says ENABLED=no but the kernel shows ufw active: config is stale.")
+    return notes
+
+
 def snapshot(
     rootfs: str,
     listeners: list[dict[str, Any]],
     listener_notes: list[str],
     limit: int = DEFAULT_LIMIT,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """ufw state and, per listening socket, what the input rules decide for it."""
     limit = max(1, min(limit, MAX_LIMIT))
+    kernel = read_kernel_snapshot(rootfs, now)
     conf = _read_file(rootfs, UFW_CONF)
     defaults_file = _read_file(rootfs, UFW_DEFAULTS)
     rule_files = {family: _read_file(rootfs, path) for family, path in UFW_RULES.items()}
@@ -327,13 +477,15 @@ def snapshot(
             )
     else:
         status = "enabled_in_config" if enabled else "inactive"
-    if enabled:
+    notes.extend(_kernel_notes(kernel, enabled, default_settings.get("IPV6") == "yes"))
+    if enabled and kernel["state"] not in ("verified", "inactive"):
         notes.append(
             "enabled_in_config reads ENABLED in ufw.conf. `ufw status` also confirms the "
-            "ufw-user-input chain is loaded in the kernel, which needs CAP_NET_ADMIN and is "
-            "not read here (kernel_chains_verified is false)."
+            "ufw-user-input chain is loaded in the kernel. The pod lacks CAP_NET_ADMIN to read "
+            "it, and the host snapshot did not settle it (see `kernel`), so "
+            "kernel_chains_verified is false."
         )
-    elif conf["readable"]:
+    elif conf["readable"] and not enabled:
         notes.append(
             "ufw is not filtering. Any other netfilter rules (nftables, iptables, kube-proxy) "
             "are not read by this tool."
@@ -362,6 +514,11 @@ def snapshot(
         family = listener["family"]
         filtering = enabled
         reason = "ufw is inactive" if enabled is False else f"{UFW_CONF} unreadable"
+        # A fresh kernel reading outranks the config, which can outlive its chains.
+        if kernel["state"] == "inactive":
+            filtering, reason = False, "the host snapshot shows ufw inactive in the kernel"
+        elif kernel["state"] == "verified":
+            filtering = True
         if filtering and family == "v6" and not ipv6_managed:
             filtering, reason = False, "IPV6=no in /etc/default/ufw, so ufw leaves ip6tables alone"
         exposures.append(
@@ -381,7 +538,8 @@ def snapshot(
     return {
         "status": status,
         "enabled_in_config": enabled,
-        "kernel_chains_verified": False,
+        "kernel_chains_verified": kernel["state"] == "verified",
+        "kernel": kernel,
         "ipv6_managed": ipv6_managed,
         "default_policy": policies,
         "logging": conf_settings.get("LOGLEVEL") if conf["readable"] else None,

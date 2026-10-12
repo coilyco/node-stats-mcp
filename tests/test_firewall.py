@@ -9,6 +9,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -345,6 +347,206 @@ def test_the_module_has_no_way_to_run_a_command_or_write_a_file() -> None:
         and node.func.attr in {"write_text", "write_bytes", "unlink", "chmod", "mkdir", "touch"}
     ]
     assert opens == []
+
+
+# --- the host snapshot (COI-2704) ---------------------------------------------
+
+NOW = datetime(2026, 10, 12, 4, 0, 0, tzinfo=UTC)
+UFW_ACTIVE = "Status: active\nLogging: on (low)\nDefault: deny (incoming)\n"
+NFT_WITH_CHAINS = (
+    "table ip filter {\n\tchain ufw-user-input {\n\t\ttcp dport 22 accept\n\t}\n}\n"
+    "table ip6 filter {\n\tchain ufw6-user-input {\n\t}\n}\n"
+)
+NFT_WITHOUT_CHAINS = "table ip filter {\n\tchain KUBE-FORWARD {\n\t}\n}\n"
+
+
+def _dump(
+    *,
+    taken: str = "2026-10-12T03:58:00Z",
+    ufw: str | None = UFW_ACTIVE,
+    nft: str | None = NFT_WITH_CHAINS,
+    header: str | None = None,
+) -> str:
+    lines = [header or f"# host-firewall-snapshot {taken} host=kai-server"]
+    if ufw is not None:
+        lines += ["## ufw status verbose", ufw.rstrip("\n")]
+    if nft is not None:
+        lines += ["## nft list ruleset", nft.rstrip("\n")]
+    return "\n".join(lines) + "\n"
+
+
+def _put_snapshot(host: str, text: str, *, age: int = 120) -> None:
+    path = Path(host) / firewall.SNAPSHOT_PATH.lstrip("/")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    stamp = (NOW - timedelta(seconds=age)).timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+def _kernel(tmp_path: Path, text: str | None, *, age: int = 120, **host: Any) -> dict[str, Any]:
+    root = _host(tmp_path, **host)
+    if text is not None:
+        _put_snapshot(root, text, age=age)
+    return firewall.snapshot(root, [], [], now=NOW)
+
+
+def test_a_fresh_active_dump_with_the_ufw_chain_verifies_the_kernel(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump())
+
+    assert result["kernel_chains_verified"] is True
+    kernel = result["kernel"]
+    assert kernel["state"] == "verified"
+    assert kernel["host"] == "kai-server"
+    assert kernel["taken"] == "2026-10-12T03:58:00+00:00"
+    assert kernel["age_seconds"] == 120
+    assert kernel["stale"] is False
+    assert kernel["ufw_chains"] == ["ufw-user-input", "ufw6-user-input"]
+    assert any("kernel chains verified" in note for note in result["notes"])
+    assert not any("CAP_NET_ADMIN" in note for note in result["notes"])
+
+
+def test_a_fresh_inactive_dump_reports_ufw_inactive_in_the_kernel(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(ufw="Status: inactive\n", nft=NFT_WITHOUT_CHAINS))
+
+    assert result["kernel"]["state"] == "inactive"
+    assert result["kernel"]["ufw_status"] == "inactive"
+    assert result["kernel_chains_verified"] is False
+    assert any("shows ufw inactive in the kernel" in note for note in result["notes"])
+
+
+def test_kernel_inactive_outranks_a_config_that_says_enabled(tmp_path: Path) -> None:
+    root = _host(tmp_path)
+    _put_snapshot(root, _dump(ufw="Status: inactive\n", nft=None))
+
+    result = firewall.snapshot(root, [_listener(22)], [], now=NOW)
+
+    assert result["status"] == "enabled_in_config"
+    assert _verdicts(result)[("v4", 22)]["verdict"] == "not_filtered_by_ufw"
+    assert any("ENABLED=yes but the kernel shows ufw inactive" in n for n in result["notes"])
+
+
+def test_kernel_verified_outranks_a_config_that_says_disabled(tmp_path: Path) -> None:
+    root = _host(tmp_path, conf=UFW_CONF_OFF)
+    _put_snapshot(root, _dump())
+
+    result = firewall.snapshot(root, [_listener(22)], [], now=NOW)
+
+    assert _verdicts(result)[("v4", 22)]["verdict"] == "allow"
+    assert any("ENABLED=no but the kernel shows ufw active" in n for n in result["notes"])
+
+
+def test_a_missing_dump_is_not_deployed_and_never_inactive(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, None)
+
+    assert result["kernel"]["state"] == "not_deployed"
+    assert result["kernel_chains_verified"] is False
+    assert result["status"] == "enabled_in_config"
+    assert any("CAP_NET_ADMIN" in note for note in result["notes"])
+
+
+def test_an_old_file_mtime_makes_the_dump_stale(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(), age=901)
+
+    assert result["kernel"]["state"] == "stale"
+    assert result["kernel"]["stale"] is True
+    assert result["kernel_chains_verified"] is False
+
+
+def test_a_dump_at_exactly_the_limit_is_still_fresh(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(taken="2026-10-12T03:45:00Z"), age=900)
+
+    assert result["kernel"]["state"] == "verified"
+
+
+def test_an_old_header_makes_the_dump_stale_even_when_the_file_was_touched(
+    tmp_path: Path,
+) -> None:
+    result = _kernel(tmp_path, _dump(taken="2026-10-12T03:00:00Z"), age=10)
+
+    assert result["kernel"]["state"] == "stale"
+    assert result["kernel"]["age_seconds"] == 3600
+
+
+def test_a_failed_ufw_command_is_an_error_not_inactive(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(ufw="ERROR: problem running ufw\nufw exited 1\n"))
+
+    assert result["kernel"]["state"] == "ufw_error"
+    assert "ufw exited 1" in result["kernel"]["problem"]
+    assert result["kernel_chains_verified"] is False
+
+
+def test_an_active_dump_whose_nft_failed_is_not_verified(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(nft="Operation not permitted\nnft exited 1\n"))
+
+    assert result["kernel"]["state"] == "nft_error"
+    assert result["kernel_chains_verified"] is False
+
+
+def test_an_inactive_dump_needs_no_nft_section(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(ufw="Status: inactive\n", nft="nft exited 127\n"))
+
+    assert result["kernel"]["state"] == "inactive"
+
+
+def test_an_active_dump_without_the_ufw_chain_is_not_verified(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(nft=NFT_WITHOUT_CHAINS))
+
+    assert result["kernel"]["state"] == "chains_missing"
+    assert result["kernel_chains_verified"] is False
+
+
+def test_a_truncated_dump_does_not_prove_a_chain_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    text = _dump(nft="table ip filter {\n" + "\tchain KUBE-X {\n\t}\n" * 50 + NFT_WITH_CHAINS)
+    monkeypatch.setattr(firewall, "MAX_SNAPSHOT_BYTES", len(_dump(nft=None)) + 200)
+
+    result = _kernel(tmp_path, text)
+
+    assert result["kernel"]["source"]["truncated"] is True
+    assert result["kernel"]["state"] == "unconfirmed"
+    assert result["kernel_chains_verified"] is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "no header here\n## ufw status verbose\nStatus: active\n",
+        "# host-firewall-snapshot not-a-time host=kai-server\n## ufw status verbose\nStatus: up",
+        _dump(ufw=None),
+        "",
+    ],
+)
+def test_a_dump_that_is_not_the_contract_is_malformed_and_never_verifies(
+    tmp_path: Path, text: str
+) -> None:
+    result = _kernel(tmp_path, text)
+
+    assert result["kernel"]["state"] == "malformed"
+    assert result["kernel_chains_verified"] is False
+
+
+def test_a_status_line_missing_from_the_ufw_section_is_unknown(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(ufw="WARN: something odd\n"))
+
+    assert result["kernel"]["state"] == "ufw_error"
+
+
+def test_an_unreadable_dump_is_reported_not_raised(tmp_path: Path) -> None:
+    root = _host(tmp_path)
+    (Path(root) / firewall.SNAPSHOT_PATH.lstrip("/")).mkdir(parents=True)
+
+    result = firewall.snapshot(root, [], [], now=NOW)
+
+    assert result["kernel"]["state"] == "unreadable"
+    assert result["kernel_chains_verified"] is False
+
+
+def test_a_verified_dump_with_ipv6_managed_but_no_v6_chain_says_so(tmp_path: Path) -> None:
+    result = _kernel(tmp_path, _dump(nft="table ip filter {\n\tchain ufw-user-input {\n\t}\n}\n"))
+
+    assert result["kernel"]["state"] == "verified"
+    assert any("ufw6-user-input is not in" in note for note in result["notes"])
 
 
 # --- the registered tool ----------------------------------------------------

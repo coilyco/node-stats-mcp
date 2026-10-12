@@ -3301,11 +3301,13 @@ async def get_host_firewall(limit: int = firewall.DEFAULT_LIMIT) -> dict[str, An
     questions a seat asks. `status_verbose_header` carries the lines that command
     prints above its table, for a by-eye match.
 
-    NOT a kernel read: `kernel_chains_verified` is always false. `ufw status` also
-    confirms the ufw-user-input chain is loaded, which needs CAP_NET_ADMIN. When
-    ufw.conf says ENABLED=no the answer is inactive. When it says yes, the notes say
-    what is left unconfirmed. Each listener's `verdict` is what the INPUT rules decide
-    for a source that matches no restricted rule, with the restricted rules listed.
+    The kernel half comes from a host timer's dump of `ufw status verbose` and
+    `nft list ruleset` (the `kernel` object, with its age). `kernel_chains_verified`
+    is true only for a fresh dump showing ufw active with its chains loaded. A
+    missing, stale or failed dump verifies nothing, and a missing one is never
+    inactive. Without it, ufw.conf ENABLED=no reads inactive and yes is unconfirmed.
+    Each listener's `verdict` is what the INPUT rules decide for a source that
+    matches no restricted rule, with the restricted rules listed.
 
     `limit` caps rules per family and listeners. Needs the host mount for the rules
     and hostNetwork for the listener view of the node. No tool path accepts a file name.

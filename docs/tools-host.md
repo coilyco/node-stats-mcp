@@ -15,7 +15,7 @@ Every tool is read-only. The k3s tools are in [k3s tools](tools-k3s.md).
 - **get_conntrack** - netfilter connection tracking count against max, plus every per-CPU error column the kernel publishes, summed by name. See [networking tools](tools-network.md). Declares a view, see [MCP Apps views](mcp-apps-views-node.md).
 - **get_socket_states** - TCP socket counts by state, the constant-cost sockstat summary, and ephemeral port usage against the configured range. See [networking tools](tools-network.md).
 - **get_resolver** - the node's DNS resolver, and optionally a pod's own as the container sees it. See [networking tools](tools-network.md).
-- **get_host_firewall** - ufw enabled state, default policies, IPv4 and IPv6 rules, and what the input rules decide for each listening socket, read from ufw's own config files. Reports `kernel_chains_verified: false`. See [host firewall tool](tools-firewall.md).
+- **get_host_firewall** - ufw enabled state, default policies, IPv4 and IPv6 rules, and what the input rules decide for each listening socket, read from ufw's own config files, plus a host-written kernel snapshot that sets `kernel_chains_verified`. See [host firewall tool](tools-firewall.md).
 - **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
 - **get_configured_freshness** - metadata-only freshness state for server-configured host success markers.
 - **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users. Declares a view, see [MCP Apps views](mcp-apps-views-node.md).
