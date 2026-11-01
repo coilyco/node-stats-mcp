@@ -83,10 +83,9 @@ Dev commands are declared in the [`justfile`](justfile). Run them as `just <verb
 
 ## Image
 
-Every push to canonical `main` publishes the private single-architecture image
-`forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>`.
-The trusted publisher verifies the remote manifest. The deploy repository owns
-the separate package-read pull Secret and rolls that exact reference.
+Every push to canonical `main` publishes the single-architecture image
+`ghcr.io/coilyco/node-stats-mcp:<full-source-sha>`. The publisher verifies the
+remote manifest. Flux applies the rollout from the deploy repository (COI-3042).
 The small single-architecture runtime avoids the concurrent-manifest and
 large-upload publisher paths.
 
