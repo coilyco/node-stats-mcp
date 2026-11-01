@@ -51,7 +51,7 @@ build-docker *ARGS:
 smoke-docker *ARGS:
     @docker run --rm --entrypoint python node-stats-mcp:local -c "import node_stats_mcp.server" "$@"
 
-# Validate the trusted Forgejo OCI publisher shell contract.
+# Validate the trusted GHCR publisher shell contract.
 check-publish *ARGS:
     @bash -n scripts/publish-image.sh "$@"
 

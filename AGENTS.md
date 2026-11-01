@@ -34,17 +34,15 @@ Route every command through just, never bare `uv` / `pytest`. Verbs are declared
 
 ## Cross-repo contracts
 
-The image is published privately to
-`forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>` by
-[`.forgejo/workflows/build-publish.yml`](.forgejo/workflows/build-publish.yml)
-on every push to main. The `test` job also runs on pull requests to main, and `publish` runs only from `main`, for any event. The trusted publisher uses a package-write credential.
-The deploy repo receives only the package-read credential and rolls the same
-immutable reference. Keep the dependency surface tiny (psutil + mcp). A new
+The image is published to `ghcr.io/coilyco/node-stats-mcp:<full-source-sha>` by
+[`.github/workflows/build-publish.yml`](.github/workflows/build-publish.yml)
+on every push to main. The `test` job also runs on pull requests to main, and `publish` runs only from `main`, for any event. The publisher uses the job's `GITHUB_TOKEN` with `packages: write`.
+The deploy repo rolls the same immutable reference through Flux. Keep the dependency surface tiny (psutil + mcp). A new
 dependency needs a reason.
 
 ## Release
 
-Push to main. CI tests, publishes one source-SHA image to Forgejo OCI, and
+Push to main. CI tests, publishes one source-SHA image to GHCR, and
 proves the remote manifest exists. There is no version bump or moving tag.
 Deferred cleanup gets a Forgejo issue, never a silent skip.
 

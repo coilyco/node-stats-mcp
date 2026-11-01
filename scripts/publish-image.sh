@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-registry="forgejo.coilysiren.me"
-image_name="coilyco-flight-deck/node-stats-mcp"
+registry="ghcr.io"
+image_name="coilyco/node-stats-mcp"
 
-if [ -z "${REGISTRY_TOKEN:-}" ]; then
-  echo "REGISTRY_TOKEN is required for the trusted image-publish lane." >&2
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "GITHUB_TOKEN is required for the trusted image-publish lane." >&2
   exit 1
 fi
 
@@ -27,11 +27,13 @@ trap 'rm -rf "${docker_config}"' EXIT
 chmod 700 "${docker_config}"
 export DOCKER_CONFIG="${docker_config}"
 
-printf '%s' "${REGISTRY_TOKEN}" \
-  | docker login "${registry}" --username coilyco-ops --password-stdin
+printf '%s' "${GITHUB_TOKEN}" \
+  | docker login "${registry}" --username "${GITHUB_ACTOR:-coilyco-ops}" --password-stdin
 
 echo "==> building ${image}"
-docker build --pull -t "${image}" .
+docker build --pull \
+  --label "org.opencontainers.image.source=https://github.com/coilyco/node-stats-mcp" \
+  -t "${image}" .
 
 echo "==> smoke-testing ${image}"
 docker run --rm --entrypoint python "${image}" -c "import node_stats_mcp.server"

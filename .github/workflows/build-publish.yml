@@ -1,10 +1,5 @@
-# Tests on every pull request to main and every push to main, then publishes
-# the node-stats-mcp image to Forgejo OCI from refs/heads/main only, whatever
-# the event. The publish job runs on the runner that holds the registry token,
-# so a pull_request or a branch dispatch must never reach it. No deploy stage
-# here: rollout is driven from
-# coilyco-bridge/deploy/services/node-stats-mcp per the layer invariant
-# (source -> deploy).
+# Tests every pull request and main push, then pushes the node-stats-mcp image to GHCR
+# from main only. Rollout is Flux from coilyco/deploy, and no cluster credential here.
 name: build-publish
 
 on:
@@ -16,12 +11,22 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: docker
-    container: forgejo.coilysiren.me/coilyco-flight-deck/agentic-os:release
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: coilyco/agentic-os/actions/setup-ci@0dc318a369ff34254a7187b5b1b85ff9b6580750
+        with:
+          tools: just uv
+
       - run: uv sync --group dev
       - run: uv run pytest
       - run: uv run ruff check src tests
@@ -35,19 +40,32 @@ jobs:
         continue-on-error: true
         env:
           SENTRY_DSN: ${{ secrets.SENTRY_CI_DSN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 scripts/alert_sentry.py
+
   publish:
     if: ${{ github.ref == 'refs/heads/main' }}
-    runs-on: deploy
     needs: [test]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - name: Publish immutable image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/publish-image.sh
+
       - name: Alert Sentry on main failure
         if: ${{ failure() && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         env:
           SENTRY_DSN: ${{ secrets.SENTRY_CI_DSN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 scripts/alert_sentry.py
