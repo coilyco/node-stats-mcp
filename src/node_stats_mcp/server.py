@@ -1,19 +1,9 @@
 """FastMCP server exposing node-local host introspection over streamable-HTTP.
 
-Read-only by construction: every tool is a read, no tool mutates the host. True
-node stats (not the pod's cgroup view) rely on the deployment giving the pod
-the host's namespaces - hostPID for processes, hostNetwork for net counters -
-and CPU/memory come from the non-namespaced /proc/{stat,meminfo} directly. Disk
-reads resolve under ROOTFS (the host root, mounted read-only at /host in the
-pod). The k3s inventory tools read the Kubernetes API through a host-mounted
-k3s admin kubeconfig when available, with a service-account fallback, and stay
-read-only. See the deploy bundle in coilyco-bridge/deploy/services/node-stats-mcp.
-
-File introspection is prefix-allowlisted, never arbitrary: stat_path and
-read_text_head resolve the real path and refuse anything outside
-NODE_STATS_READABLE_ROOTS (empty by default = file reads denied). This is the
-enum-not-path discipline from the upstream node-introspection example,
-generalized to a root allowlist, so the tool cannot be walked into /host/root/.ssh.
+Read-only by construction: every tool is a read, no tool mutates the host. File
+reads (stat_path, read_text_head) resolve the real path and refuse anything
+outside NODE_STATS_READABLE_ROOTS. Host namespaces, ROOTFS, and the k3s
+kubeconfig fallback: docs/security.md, docs/configuration.md, docs/k3s-inventory.md.
 """
 
 from __future__ import annotations

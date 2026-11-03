@@ -1,12 +1,11 @@
 """MCP Apps views in a real browser: the View's own behavior, not the server contract.
 
-A stand-in host page embeds each View in a sandboxed iframe, answers `ui/initialize`, and
-sends `ui/notifications/tool-result`, the way an MCP Apps host does. The View HTML comes
-from a real `resources/read`, so the page under test is what a host would receive.
+A stand-in host page embeds each View in a sandboxed iframe and answers `ui/initialize`
+and `ui/notifications/tool-result` the way an MCP Apps host does, with View HTML from a
+real `resources/read`.
 
 Deselected by default (the `browser` marker). `just check-views` runs it and CI calls
-that verb. A missing browser fails the run: a skip here would be a silent pass.
-See docs/mcp-apps-views.md.
+that verb. A missing browser fails the run, never skips. See docs/mcp-apps-views.md.
 """
 
 from __future__ import annotations
