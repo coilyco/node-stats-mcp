@@ -69,3 +69,12 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_CI_DSN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 scripts/alert_sentry.py
+
+  gate:
+    name: gate
+    needs: [test, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
